@@ -611,6 +611,14 @@ static void cmd_mem(void) {
     vga_write("  total   : ");
     vga_writeln(buf);
 
+    /* 堆区的地址范围：调内存相关的 bug 时最先要看的就是这个
+     * （曾经堆区横跨过 0x90000 那块引导栈，见 kernel/heap.c 的注释） */
+    vga_write("  range   : ");
+    vga_write_hex(heap_region_start());
+    vga_write(" - ");
+    vga_write_hex(heap_region_start() + heap_region_size());
+    vga_writeln("");
+
     format_size(h_used, buf, sizeof(buf));
     vga_write("  in use  : ");
     vga_writeln(buf);

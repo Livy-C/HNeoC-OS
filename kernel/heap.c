@@ -24,6 +24,11 @@ typedef struct block {
 
 static block_t* heap_head  = NULL;
 static uint32_t heap_total = 0;   /* 堆区总字节数 */
+static uint32_t heap_base  = 0;   /* 堆区起始物理地址（也就是虚拟地址，恒等映射） */
+
+/* 堆区在哪、有多大。给 mem 命令显示用，也给下面的一致性检查用。 */
+uint32_t heap_region_start(void) { return heap_base; }
+uint32_t heap_region_size(void)  { return heap_total; }
 
 void heap_init(void) {
     /* 向物理内存管理器要一段连续页框。内存碎片化时大块可能拿不到，
@@ -51,6 +56,24 @@ void heap_init(void) {
     }
 
     heap_total = pages * PAGE_SIZE;
+    heap_base  = (uint32_t)region;
+
+    /* 堆区不能和引导栈（0x90000 往下那一段）重叠。
+     *
+     * 这条检查值一个 panic：堆区是"内核映像之后第一段够大的连续页框"，
+     * 而 0x90000 那块引导栈就在这中间 —— 只要有人申请一块足够大的内存
+     * （比如加载一个 500KB 的 .lxe），返回的缓冲区就会正好盖在正在使用的
+     * Shell 内核栈上，往缓冲区里写数据 = 把返回地址踩烂，CPU 直接三重故障，
+     * 现场什么都不剩。这个坑查了很久，最后是靠"大 .data 会崩、大 .bss 不崩"
+     * 这组对照实验定出来的。
+     */
+    if (!(heap_base + heap_total <= 0x00080000u || heap_base >= 0x00090000u)) {
+        heap_head  = NULL;
+        heap_total = 0;
+        heap_base  = 0;
+        /* 这里不能用 panic（它要往串口写），交给调用方看 heap_region_size() */
+        return;
+    }
 
     /* 整段内存做成一整块空闲区 */
     heap_head            = (block_t*)region;

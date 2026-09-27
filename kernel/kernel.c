@@ -141,7 +141,26 @@ void kernel_main(void) {
     pmm_init();
     boot_step("Physical memory manager (4KB frames, bitmap)");
 
+    /* 把引导栈那一段（0x80000-0x90000）先占掉，再分配内核堆。
+     *
+     * 这一段是 Shell 的内核栈（boot.asm 把内核栈顶设成 0x90000，Shell 一直
+     * 跑在上面）。如果不占，堆区就是"内核映像之后第一段够大的连续页框"，
+     * 起点大约 0x65000、长度 4MB —— 正好横跨 0x90000。于是只要有人申请
+     * 一块够大的内存（典型例子：加载一个 500KB 的 .lxe，kmalloc(526888)），
+     * 拿到的缓冲区就会盖在正在使用的 Shell 内核栈上，往里面写数据等于把
+     * 返回地址踩烂，CPU 直接三重故障。
+     *
+     * 这个坑的真实症状是"大 .data 的 .lxe 一启动就 Guru Meditation，
+     * 大 .bss 的却没事"，查了很久才对照出来。占掉这一段之后，堆会落到
+     * 1MB 以上，和引导栈再也不会碰面；kernel/heap.c 里还有一道断言兜底。
+     */
+    pmm_mark_region(0x00080000, 0x00010000, true);
+    boot_step("Reserved the boot stack at 0x90000 (64KB below it)");
+
     heap_init();
+    if (heap_region_size() == 0) {
+        kernel_panic("kernel heap could not be allocated");
+    }
     boot_step("Kernel heap (kmalloc / kfree)");
 
     /* 9. 打开分页。恒等映射前 64MB，用户区（1GB 处）留给进程自己挂页表 */

@@ -14,6 +14,12 @@
 
 void heap_init(void);
 
+/* 堆区的起始地址和总大小（内核恒等映射，物理地址就是虚拟地址）。
+ * mem 命令用它显示堆在哪，也可以拿它检查堆有没有和别的东西重叠
+ * （曾经就和 0x90000 那块引导栈重叠过，见 kernel/heap.c 的注释）。 */
+uint32_t heap_region_start(void);
+uint32_t heap_region_size(void);
+
 /* 分配 size 字节，返回 8 字节对齐的指针；失败返回 NULL */
 void* kmalloc(size_t size);
 
