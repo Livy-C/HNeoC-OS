@@ -54,6 +54,19 @@ int  getargs(char* buf, size_t max);
  */
 char* getcwd(char* buf, size_t max);
 
+/* 改权限位（只取低 9 位：属主三位 + 其他人三位）。
+ * 只有 root / 管理员 / 文件属主能改，其它情况返回负的错误码。
+ * 装包时靠它给 .lxe 补执行位。
+ */
+int  chmod(const char* path, int mode);
+
+/* 我是谁：getuid() 是当前进程的 uid（0 是 root），
+ * is_admin() 表示这个账户能不能碰别人的东西（uid 0 或 /etc/passwd 里 admin=1）。
+ * 内核用一个 whoami 调用把两个信息一起带回来。
+ */
+int  getuid(void);
+int  is_admin(void);
+
 /* ============================================================
  * 时间与进程
  * ============================================================ */

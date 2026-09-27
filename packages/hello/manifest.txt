@@ -1,0 +1,5 @@
+name: hello
+version: 1.0
+depends:
+summary: A friendly greeting program - the hpm demo package
+admin: 0

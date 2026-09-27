@@ -35,3 +35,6 @@ vmcore.*
 # 临时文件
 tmp/
 temp/
+
+fsroot/var/hpm/repo/*.hnpkg
+fsroot/var/hpm/repo/index

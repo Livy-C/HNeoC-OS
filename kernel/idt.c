@@ -108,8 +108,21 @@ uint32_t isr_handler(registers_t* regs) {
             vga_write("   EIP ");
             vga_write_hex32(regs->eip);
             if (regs->int_no == 14) {
+                uint32_t cr2 = paging_fault_address();
+
                 vga_write("   CR2 ");
-                vga_write_hex32(paging_fault_address());
+                vga_write_hex32(cr2);
+
+                /* 出错地址紧贴用户栈底下面 → 几乎肯定是栈溢出。
+                 * 栈溢出被报成"缺页"最容易被当成内核 bug 去查，
+                 * 直接把猜测打出来能省掉一整轮排查。
+                 */
+                if (cr2 < p->user_stack_base &&
+                    cr2 + 0x10000u >= p->user_stack_base) {
+                    vga_write("  (stack overflow? the stack starts at ");
+                    vga_write_hex32(p->user_stack_base);
+                    vga_write(")");
+                }
             }
             vga_writeln("");
             vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);

@@ -24,7 +24,7 @@
 #define PROCESS_MAX        16
 #define PROCESS_KERNEL_STACK_SIZE  (8 * 1024)
 #define PROCESS_MAX_IMAGE_PAGES    768          /* 3MB 上限 */
-#define PROCESS_STACK_PAGES        4            /* 16KB 用户栈 */
+#define PROCESS_STACK_PAGES        8            /* 32KB 用户栈 */
 #define PROCESS_NAME_FIELD         16
 #define PROCESS_MAX_FDS            16
 #define PROCESS_ARGS_MAX           128

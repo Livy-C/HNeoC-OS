@@ -53,6 +53,8 @@
 #define SYS_MKDIR     22
 #define SYS_GETARGS   23
 #define SYS_GETCWD    24
+#define SYS_CHMOD     25
+#define SYS_WHOAMI    26
 
 /* ============================================================
  * 系统调用原语

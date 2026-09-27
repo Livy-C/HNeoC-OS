@@ -62,6 +62,19 @@ int getargs(char* buf, size_t max) {
     return (int)__syscall2(SYS_GETARGS, (int32_t)buf, (int32_t)max);
 }
 
+int chmod(const char* path, int mode) {
+    return (int)__syscall2(SYS_CHMOD, (int32_t)path, mode);
+}
+
+/* whoami 的低 16 位是 uid，bit16 是管理员标志（见内核 sys_whoami） */
+int getuid(void) {
+    return (int)((unsigned int)__syscall0(SYS_WHOAMI) & 0xFFFFu);
+}
+
+int is_admin(void) {
+    return ((unsigned int)__syscall0(SYS_WHOAMI) & 0x10000u) ? 1 : 0;
+}
+
 char* getcwd(char* buf, size_t max) {
     int r;
 

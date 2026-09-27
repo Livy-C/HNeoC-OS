@@ -1,0 +1,26 @@
+HNeoFS - the HNeoC disk layout
+==============================
+
+The image is a raw disk: 512-byte sectors, no partition table. The
+kernel finds the file system at a fixed place, 1 MB into the disk, and
+everything after the superblock follows from there.
+
+  LBA 2048        superblock (512 bytes), magic 'HNFS', version 2
+  LBA 2049-2056   file table: 8 sectors = 64 entries of 64 bytes
+  LBA 2057-...    file data, files packed back to back
+
+The superblock stores block_size (512), total_blocks, the used entry
+count, table_lba, data_lba, a free_lba hint and a 32-byte volume label.
+
+Every entry is 64 bytes: a 32-byte name (one path component, no '/'),
+start_lba, size, flags, entry_offset, type (0 = file, 1 = directory),
+parent, mode and uid. File data is contiguous, so start_lba plus size is
+enough to read a file - no clusters, no extent list, no bitmap.
+
+Directories are entries too, and each one stores the table index of its
+containing directory in "parent". The root directory has no entry of its
+own: its children simply use parent = 0xFFFFFFFF.
+
+Modes are 0755 for directories and .lxe files, 0644 for everything else,
+and uid 0 means root. Deleting leaves a hole in the table instead of
+compacting it, so indices stay stable and parent links never break.

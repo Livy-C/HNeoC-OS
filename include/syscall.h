@@ -45,8 +45,10 @@
 #define SYS_MKDIR     22   /* mkdir(path) -> 0，失败返回负的错误码 */
 #define SYS_GETARGS   23   /* getargs(buf, max) -> 拷贝出来的字节数 */
 #define SYS_GETCWD    24   /* getcwd(buf, max) -> 路径长度 */
+#define SYS_CHMOD     25   /* chmod(path, mode) -> 0，失败返回负的错误码 */
+#define SYS_WHOAMI    26   /* whoami() -> uid | (admin << 16) */
 
-#define SYS_COUNT     25
+#define SYS_COUNT     27
 
 /* 目录遍历的返回值里，用 bit30 表示"这是个目录"。
  *

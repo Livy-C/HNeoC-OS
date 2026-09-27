@@ -1,0 +1,5 @@
+name: examples
+version: 1.0
+depends: hello,tools
+summary: Example C sources for the on-OS hncc compiler
+admin: 0

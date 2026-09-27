@@ -1,0 +1,24 @@
+hpm - the HNeoC package manager
+===============================
+
+HNeoC has no network, so the "repository" is just a directory on the
+disk: /var/hpm/repo. It holds one .hnpkg file per package, plus an
+index that "hpm update" rebuilds by scanning that directory.
+
+  hpm update             rescan /var/hpm/repo and rebuild the index
+  hpm search [word]      search the index, print matching packages
+  hpm info <name>        print name, version, depends, summary, files
+  hpm install <name>     unpack, chmod every file, record it in the db
+  hpm list               list installed packages (db: /var/hpm/installed)
+  hpm files <name>       list the files a package owns
+  hpm verify [name]      check installed files against the database
+  hpm remove <name>      delete a package's files and its records
+
+A .hnpkg file is a 256-byte header, a table of 64-byte entries and the
+file contents back to back. Every entry carries the install path relative
+to "/" (for example "bin/hi.lxe"), the size and the permission bits, so
+installing is just "write the bytes where the table says, then chmod the
+mode the entry asked for".
+
+Installed state is one line per package in /var/hpm/installed. The
+database is plain text, so a broken install can be inspected by hand.

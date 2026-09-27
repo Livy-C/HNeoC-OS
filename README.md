@@ -208,6 +208,8 @@ typedef struct {
 | `bigio` | `bigio.lxe` | 一次写完 2MB，验证长 I/O 期间中断没被关死、写入没被截断 |
 | `note` | `note.lxe` | 往 notes.txt 追加一行，用来验证数据真的落盘 |
 | `termdemo` | `termdemo.lxe` | term.h 终端 API 示例：固定状态栏 + 滚动区域 + 进度条 |
+| `hpm` | `hpm.lxe` | 包管理器：装/卸/查软件包（见下文） |
+| `hncc` | `hncc.lxe` | C 编译器：把 `.c` 直接编成能跑的 `.lxe`（见下文） |
 
 ### vi：一个能用的全屏编辑器
 
@@ -441,6 +443,129 @@ guest:0f88c14d:1001:/home:0
 
 ---
 
+## 包管理器：hpm 与 .hnpkg
+
+HNeoC 没有网络，所以"软件源"就是磁盘上的一个目录：`/var/hpm/repo` 里放着
+一批 `.hnpkg` 文件和一个纯文本索引。用法照着 apt 来：
+
+```text
+hneoc$root~/ hpm avail
+available packages
+--------------------------------------------------
+    docs       1.0    Plain text notes about hpm and the HNeoFS disk layout
+    examples   1.0    Example C sources for the on-OS hncc compiler
+    hello      1.0    A friendly greeting program - the hpm demo package
+  i tools      1.0    Small command line tools - calc, an integer calculator
+--------------------------------------------------
+  4 package(s)   ('i' = already installed)
+
+hneoc$root~/ hpm install examples
+installing hello 1.0
+  + /bin/hi.lxe                        1440 B  mode 0755
+  installed hello 1.0 (1 files)
+installing tools 1.0
+  + /bin/calc.lxe                      2828 B  mode 0755
+  installed tools 1.0 (1 files)
+installing examples 1.0
+  + /share/examples/count.c            2646 B  mode 0644
+  + /share/examples/hello.c            2009 B  mode 0644
+  installed examples 1.0 (2 files)
+
+hneoc$root~/ hi
+hello 1.0 - installed with hpm
+```
+
+| 子命令 | 作用 |
+|--------|------|
+| `hpm` | 用法 + 仓库/已装概况 + 当前身份 |
+| `hpm list` | 已装的包 |
+| `hpm avail` | 仓库里能装的包（`i` 表示已装） |
+| `hpm search <词>` | 按包名和说明搜 |
+| `hpm info <包名>` | 详细信息，并且真的去读一遍包头做对照 |
+| `hpm install <包名>...` | 安装，**自动先装依赖**（`examples` 依赖 `hello` + `tools`） |
+| `hpm remove <包名>` | 卸载：删掉它装出来的每个文件，并更新数据库 |
+| `hpm files <包名>` | 这个包装了哪些文件 |
+| `hpm verify` | 检查已装文件是不是都还在 |
+| `hpm update` | 重扫仓库目录、重建索引（相当于 `apt update`，只是源在本地） |
+
+### .hnpkg 包格式
+
+一个包就是一个文件，布局和 HNeoFS 自己是同一个思路 —— "表 + 连续数据"，
+因为两边都只需要顺序读一遍：
+
+```
+[0        .. 255]  包头：magic 'HNPK' / 版本 / 包名 / 版本号 / 依赖 / 说明 / 文件数
+[256      ..    ]  文件表：每项 64 字节（安装路径 / 偏移 / 大小 / 权限位）
+[data_offset ..]   文件数据，表项里的偏移都相对于这里
+```
+
+表项里的 `path` 是**相对根的安装路径**（`bin/hi.lxe`、`share/docs/hpm.txt`），
+`mode` 是 HNeoFS 的权限位。安装时要靠它恢复权限 —— 新建的文件默认是 `0644`，
+**没有执行位**，非 root 用户就跑不起来；为此内核加了 `chmod` 系统调用
+（这也是真实发行版里 dpkg 要恢复文件权限的同一个理由）。
+
+宿主机那侧是"源码包"：`packages/<名字>/` 里有 `manifest.txt`（名字/版本/依赖/
+说明）、`src/*.c`（打包时编译成 `.lxe`）、`files/**`（原样装到目标路径）。
+`build.ps1` 的 `[6b2]` 步骤调用 `tools/mkhnpkg.ps1` 把它们打成
+`fsroot/var/hpm/repo/*.hnpkg`，再从**打好的包头里读回来**生成索引 ——
+这样"索引里写的"和"包里写的"必然是同一份数据，顺带在构建期就验证了
+包头能不能被解析。构建还会断言这些 `.hnpkg` 和索引真的进了镜像。
+
+---
+
+## hncc：在系统里编译 C
+
+`hncc` 是一个跑在 HNeoC 上的 C 编译器，它**自己生成 x86 机器码**，
+不经过任何汇编器或链接器：
+
+```text
+hneoc$root~/share/hncc hncc hello.c
+compiled hello.c
+  code   : 5874 bytes
+  data   : 113 bytes
+  bss    : 4 bytes
+  output : hello.lxe
+
+hneoc$root~/share/hncc ./hello.lxe
+hello from a program that hncc compiled on HNeoC
+hncc
+7
+counter after the loop:
+45
+```
+
+为什么可行：LXE 是"固定加载到 `0x40000000` 的扁平二进制 + 40 字节头部"，
+没有段、没有重定位。所以编译器只要把代码生成到一块缓冲区、把字符串和全局
+变量生成到另一块，代码里引用数据的地方先写占位、最后按
+`基址 + 代码长度 + 数据内偏移` 回填即可。整个编译器是最朴素的
+"栈机"式代码生成：表达式算完把结果留在 `eax`，二元运算左边压栈、右边
+算完再弹回来，没有任何优化 —— 换来的是一眼能看懂、出错了能对着反汇编找。
+
+| 支持 | 说明 |
+|------|------|
+| 类型 | `int` `char` `void`、指针、数组 |
+| 语句 | 声明（可带初值）、`if/else`、`while`、`do-while`、`for`、`return`、`break`、`continue` |
+| 运算 | `+ - * / %`、比较、`&& ||`（短路）、`! ~ & \| ^ << >>`、`++ --`、赋值与复合赋值、`? :`、`[]`、`()`、`&` `*`、`sizeof`、强制类型转换 |
+| 其它 | 函数（递归、前置声明）、全局变量、字符串/字符字面量、注释、`#define` 简单常量、`#include` 直接忽略 |
+
+不支持：结构体、浮点、`long long`、变参函数、真正的预处理器、多文件编译、
+数组初始化列表（`int a[3] = {1,2,3}` 要一个元素一个元素写）。
+
+**内建函数**：`putchar` `puts` `print_int` `print_hex` `getchar` `exit`
+`open` `close` `read` `write` `lseek` `unlink` `mkdir` `chmod` `readfile`
+`listdir` `sbrk` `uptime` `getpid` `getargs` `getcwd` …… 调用它们时编译器
+**直接发射 `int 0x80`**，所以用户程序不需要 `#include`，也不需要链接任何库。
+
+**运行时是"自己编译自己"**：编译器内部带着一段用这个 C 子集写的源码
+（`strlen` `strcmp` `strcpy` `memset` `memcpy` `atoi` `puts` `print_int`
+`print_hex` `malloc` `free`），每次编译用户代码之前先把它编译一遍 ——
+既是标准库，也是每次编译都在跑的自测。
+
+`/share/hncc/` 下有三个现成的例子：`hello.c`、`fib.c`（递归 + 数组 + 指针）、
+`t1.c`（诊断程序，输出全是数字，用来核对编译器本身是否正确）。
+
+---
+
 ## 系统调用
 
 用户程序用 `int 0x80` 陷入内核，调用号在 EAX，参数在 EBX/ECX/EDX，
@@ -473,8 +598,10 @@ DPL=3 让 ring 3 能调用；interrupt gate 会清 IF，避免系统调用返回
 | 22 | `mkdir(path)` | 建目录（要求父目录可写） |
 | 23 | `getargs(buf, max)` | 取命令行参数（命令名之后那段文本） |
 | 24 | `getcwd(buf, max)` | 取当前工作目录 |
+| 25 | `chmod(path, mode)` | 改权限位（装包要靠它补执行位） |
+| 26 | `whoami()` | 返回 `uid \| (admin << 16)`，用户态用 `getuid()` / `is_admin()` 拆开 |
 
-一共 25 个（`SYS_COUNT`），调用号在 `include/syscall.h` 和用户态的
+一共 27 个（`SYS_COUNT`），调用号在 `include/syscall.h` 和用户态的
 `user/lib/include/hneoc.h` 里各定义一份，**加调用时必须两边一起改**。
 
 fd 0/1/2 固定映射到控制台，其余从 3 开始分配，每个进程一张表（16 个）。
@@ -613,15 +740,23 @@ hneoc-os/
 │   ├── lib/               用户态 C 库：include/ 头文件 + src/ 薄封装
 │   ├── crt0.asm           入口
 │   ├── user.ld            用户程序链接脚本（0x40000000）
-│   └── *.c                用户程序（ls / vi / wtest / systest / fault ...）
+│   ├── hpm.c              包管理器（ring 3）
+│   ├── hncc.c             C 编译器：生成 x86 机器码 + LXE（ring 3）
+│   └── *.c                其它用户程序（ls / vi / wtest / systest / fault ...）
+├── packages/              软件包的"源码包"：manifest.txt + src/ + files/
 ├── fsroot/                被打包进镜像的文件（自动生成 .lxe）
 │   ├── bin/               用户程序
 │   ├── etc/passwd         账户表（文本，可读可改）
-│   └── home/.keep         /home 的占位文件，保证这个目录存在于镜像里
+│   ├── home/.keep         /home 的占位文件，保证这个目录存在于镜像里
+│   ├── share/hncc/*.c     给 hncc 编译的示例源码
+│   └── var/hpm/repo/      本地软件源：*.hnpkg + index（构建时生成）
 ├── tools/
-│   ├── nasm.exe  mkfs.ps1  mklxe.ps1  vm-type.ps1  vga-dump.ps1
+│   ├── nasm.exe  mkfs.ps1  mklxe.ps1  mkhnpkg.ps1
+│   ├── vm-type.ps1  vga-dump.ps1  test-scroll.ps1
+│   └── fix-bom.ps1        给带中文的 .ps1 补回 UTF-8 BOM（见陷阱 14）
 ├── build.ps1  run.ps1
 ├── linker-pe.ld  linker.ld  Makefile
+├── KNOWN-ISSUES.md
 └── README.md
 ```
 
@@ -653,6 +788,36 @@ hneoc-os/
 ```powershell
 & "D:\VB\VBoxManage.exe" debugvm "HNeoC" dumpvmcore --filename build\vmcore.elf
 ```
+
+### 把 guest 写出来的文件挖出来看
+
+调试"系统里的程序产生的东西"（比如 `hncc` 编出来的 `.lxe`）时，光看屏幕
+输出不够，要拿到文件本体：
+
+```powershell
+# 1. 关机后把 VDI 转成裸镜像（虚拟机在跑时会锁住 VDI）
+.\run.ps1 -Stop
+& "D:\VB\VBoxManage.exe" clonemedium build\hneoc-os.vdi build\guest-dump.img --format RAW
+```
+
+```powershell
+# 2. 按 HNeoFS 的目录表找到文件：表在 LBA 2049，每项 64 字节
+#    （name[32] / start_lba / size / flags / entry_offset / type / parent / mode / uid）
+$fs = [System.IO.File]::OpenRead("$pwd\build\guest-dump.img")
+$fs.Position = 2049 * 512
+$b = New-Object byte[] 4096; $null = $fs.Read($b, 0, 4096)
+# ... 第 i 项：name 在 $i*64，start_lba 在 $i*64+32，size 在 $i*64+36
+```
+
+```powershell
+# 3. 反汇编。用户程序都加载到 0x40000000，所以 --adjust-vma 用这个基址，
+#    40 字节的 LXE 头部要跳过
+& "D:\mingw32\bin\objdump.exe" -b binary -m i386 -M intel `
+    --adjust-vma=0x40000000 -D build\out.bin
+```
+
+`hncc` 的两个代码生成 bug 都是这么定出来的：一条 `e8 00 00 00 00`
+（位移没回填）和一条少掉的 `mov eax,[eax]`（指针没取值）。
 
 ---
 
@@ -778,6 +943,60 @@ hneoc-os/
     `user/lib/include/hneoc.h` 各定义一份调用号，只改一边的话用户程序会
     调到别的调用上去（而且返回值看着像普通错误）。
 
+**构建与工具链**
+
+28. **`-fdata-sections` 会让 `.bss` 彻底失效**（这条影响最大）。
+    PE 目标上 GCC 把每个变量放进独立的 `.data$变量名` 段 —— PE 用 `$`
+    当子段分隔符 —— 而 `user.ld` 里那个 `.bss` 段匹配的是 `*(.bss)` /
+    `*(.bss.*)`，一个都匹配不上。于是**所有没有初值的静态数组都被实体化
+    进 `.data`**：`.lxe` 白白胖出一个数组大小，`bss_size` 永远是 0，
+    内核里那条"按 bss_size 清零"的路径从来没被真正走过。
+    编译器加 `-fno-data-sections`（`-ffunction-sections` 保留，
+    `--gc-sections` 还是能丢没用的函数）之后，静态数据才回到真正的
+    `.bss`（NOBITS，不进文件，由加载器清零）。实测效果：
+    `hncc.lxe` 273KB → 40KB，`vi.lxe` 29.5KB → 20.8KB，`ls.lxe` 8.1KB → 4.0KB，
+    而且 `hncc` 因为体积过大触发的那个三重故障也随之消失了。
+
+29. **自己写机器码时，向后引用的位移必须当场算**。`place_label` 只在标签
+    落地那一刻回填"当时已经登记过"的引用；跳回循环开头、调用前面已经
+    发射过的函数，这些引用是在那之后才产生的，不特殊处理就会永远停在
+    位移 0 —— 也就是 `e8 00 00 00 00`（跳到下一条指令）。
+    编译照样"成功"，直到运行起来空指针缺页才发现。现在编译器在代码
+    生成结束后会断言"没有未回填的引用"，宁可当场报错也不生成坏代码。
+
+30. **指针变量和数组名的取值规则不一样**：数组名作为值就是它的地址，
+    而指针变量必须**把它存的那个地址读出来**。把两者混在一起判断
+    （"只要是指针类就不取值"），`s[i]` 就会被编成 `*(&s + i)` ——
+    读的是栈上那个指针变量的字节。症状很有辨识度：`puts("...")` 打印出
+    的是那串地址的可见字节（`$`、`?@`），因为地址第 2 个字节通常是
+    `0x1A`/`0x16`，打到那儿就遇到 `'\0'` 停了；而下标恰好取到 `0x1A` 时
+    会显示成 `26` —— 那正是数据区地址的第二字节。
+
+31. **编译器的产物要用机器码去验证，不能只看"编译成功"**。把 guest 写出的
+    `.lxe` 从 VDI 里挖出来（`VBoxManage clonemedium --format RAW`，再按
+    HNeoFS 目录表找到文件），然后
+    `objdump -b binary -m i386 -M intel --adjust-vma=0x40000000 -D` ——
+    上面那两个 bug 都是这么一眼定出来的：`e8 00 00 00 00` 和少了一条
+    `mov eax,[eax]`。
+
+32. **大数组别放栈上，递归要算栈开销**。`hpm` 的 `install_rec` 是递归的，
+    每层带 5KB 的局部数组，装 `examples` 时直接把 16KB 用户栈吃穿 ——
+    内核报的是缺页（`CR2` 落在栈底下面 3KB），看起来像内核 bug。
+    现在用户栈加到 32KB，内核在页错误时会直接提示"是不是栈溢出"，
+    但根本的写法还是：**大缓冲区放全局或者 malloc**。
+
+33. **`Get-Content` / `Set-Content` 会毁掉无 BOM 的 UTF-8 文件**。
+    PowerShell 5.1 按 GBK 读入，中文注释当场变成乱码，而且行尾的多字节
+    字符会把换行一起吃掉（一行行注释被合并成一行）。处理这类文件要用
+    .NET 的 `[System.IO.File]::ReadAllText($p, (New-Object System.Text.UTF8Encoding($false)))`。
+    改完脚本记得跑 `tools/fix-bom.ps1`。
+
+34. **系统盘满会让编译器以一个看不懂的理由失败**：GCC 的中间文件默认写到
+    系统 `%TEMP%`，盘一满就报 `error writing to ...s: No space left on device`，
+    而报错挂在某个 `.c` 文件上，看着像源码的问题。`build.ps1` 现在把
+    `TMP`/`TEMP` 指到项目自己的 `build\tmp\`，构建不再受系统盘剩余空间
+    影响（这条也是真踩过：C 盘只剩 10MB 时整个构建挂了）。
+
 ---
 
 ## 下一步可以做什么
@@ -791,6 +1010,12 @@ hneoc-os/
 - [ ] 信号机制
 - [ ] 更完整的 libc（现在是只有头文件的极简运行时）
 - [ ] 用 QEMU + GDB 做源码级调试
+- [ ] **hncc**：结构体、变参函数（`printf` 式）、数组初始化列表、`static`、
+      真正的预处理器；只发射用到的运行时函数，让产物更小
+- [ ] **hpm**：版本比较与 `hpm upgrade`、从 `.hnpkg` 文件离线安装、
+      校验和/签名、依赖版本约束
+- [ ] **搞清那个大内存三重故障**（见 `KNOWN-ISSUES.md`；`.bss` 修好之后
+      症状已经变了，需要重新定位）
 
 ---
 

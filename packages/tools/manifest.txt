@@ -1,0 +1,5 @@
+name: tools
+version: 1.0
+depends:
+summary: Small command line tools - calc, an integer calculator
+admin: 0

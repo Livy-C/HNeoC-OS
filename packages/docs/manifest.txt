@@ -1,0 +1,5 @@
+name: docs
+version: 1.0
+depends:
+summary: Plain text notes about hpm and the HNeoFS disk layout
+admin: 0

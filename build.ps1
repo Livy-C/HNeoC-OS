@@ -31,6 +31,16 @@ $vdiFile  = Join-Path $buildDir "hneoc-os.vdi"
 # 这样构建中途出错、或者被 Ctrl+C 打断时，上次那个完好的镜像不会被半成品覆盖。
 $imgTmp   = Join-Path $buildDir "hneoc-os.building.img"
 
+# GCC / NASM 的中间文件默认写到系统 %TEMP%，也就是 C: 盘。系统盘一旦被占满，
+# 编译器会以 "No space left on device" 直接失败，而报错出现在某个 .c 文件上，
+# 看起来像是源码的问题。把临时目录挪到项目自己所在的盘上，构建就不再受
+# 系统盘剩余空间影响（这一条是被真实踩到之后加的：C: 只剩 10MB 时
+# wtest.c 报 "error writing to ...ccZzLHHI.s: No space left on device"）。
+$tmpDir = Join-Path $buildDir "tmp"
+New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+$env:TMP  = $tmpDir
+$env:TEMP = $tmpDir
+
 function Write-Step($text) {
     Write-Host "  $text" -ForegroundColor Cyan
 }
@@ -250,6 +260,10 @@ $fsRoot  = Join-Path $root "fsroot"
 $fsBin   = Join-Path $fsRoot "bin"      # 可执行程序统一放 /bin 下
 $nmExe   = Join-Path $mingwBin "nm.exe"
 
+# 软件包源码与打包出来的 .hnpkg 仓库目录（宿主机侧）
+$packagesDir = Join-Path $root "packages"
+$fsRepo      = Join-Path $fsRoot "var\hpm\repo"
+
 if (Test-Path $userDir) {
     Write-Step "[6b] 编译用户程序"
 
@@ -272,7 +286,16 @@ if (Test-Path $userDir) {
         "-fno-stack-protector", "-fno-asynchronous-unwind-tables",
         # MinGW 在 PE 目标上会给大栈帧插入 __chkstk_ms 调用，裸机链接时没有它
         "-mno-stack-arg-probe",
-        "-ffunction-sections", "-fdata-sections",
+        # -ffunction-sections 留着：没被调用的库函数会被 --gc-sections 丢掉。
+        #
+        # 但 -fdata-sections 必须**关掉**：PE 目标上 GCC 把每个变量放进
+        # ".data$变量名"（PE 用 $ 当子段分隔符），而 user.ld 里那个 .bss 段
+        # 匹配的是 *(.bss) / *(.bss.*)，于是所有**没有初值**的静态数组
+        # 都被实体化进 .data —— .lxe 白白胖出一个数组大小，bss_size 永远是 0。
+        # 关掉它，未初始化数据才会落进真正的 .bss（不进文件），由加载器按
+        # 头部里的 bss_size 清零。
+        # 实测：hncc.c 的 .data 从 233KB 降到 224 字节，.bss 变成 229KB。
+        "-ffunction-sections", "-fno-data-sections",
         "-nostdlib", "-nostdinc", "-Wall", "-Wextra", "-c",
         "-I$(Join-Path $userDir 'lib\include')", "-I$(Join-Path $root 'user')"
     )
@@ -300,12 +323,46 @@ if (Test-Path $userDir) {
     # -File 排除子目录：只把顶层的 .c 当成程序
     $programs = @(Get-ChildItem $userDir -Filter *.c -File | Sort-Object Name)
 
+    # 编译单元 = 系统程序（进 /bin）+ 软件包里的程序（进 build\packages\<包名>，
+    # 稍后由 tools\mkhnpkg.ps1 打进 .hnpkg）。
+    #
+    # 两条路的编译流程一模一样，所以合成一个列表跑同一段代码：
+    # 差别只有输出目录，以及中间文件名要带包名前缀，免得包里的
+    # hi.c 和系统里的 hi.c 抢同一个 .o。
+    $units = @()
     foreach ($src in $programs) {
-        $name = $src.BaseName
-        $obj  = Join-Path $userBuild "$name.o"
-        $pe   = Join-Path $userBuild "$name.pe"
-        $bin  = Join-Path $userBuild "$name.bin"
-        $lxe  = Join-Path $fsBin "$name.lxe"
+        $units += [pscustomobject]@{
+            Src = $src; Name = $src.BaseName; Out = $fsBin; Prefix = ""
+        }
+    }
+    $pkgDirs = @()
+    if (Test-Path $packagesDir) {
+        $pkgDirs = @(Get-ChildItem $packagesDir -Directory | Sort-Object Name)
+    }
+    $pkgPrograms = 0
+    foreach ($pkgDir in $pkgDirs) {
+        $pkgSrc = Join-Path $pkgDir.FullName "src"
+        if (-not (Test-Path $pkgSrc)) { continue }
+        $pkgOut = Join-Path $buildDir ("packages\" + $pkgDir.Name)
+        New-Item -ItemType Directory -Force -Path $pkgOut | Out-Null
+        Get-ChildItem $pkgOut -Filter *.lxe -ErrorAction SilentlyContinue |
+            Remove-Item -Force
+        foreach ($src in (Get-ChildItem $pkgSrc -Filter *.c -File | Sort-Object Name)) {
+            $units += [pscustomobject]@{
+                Src = $src; Name = $src.BaseName; Out = $pkgOut
+                Prefix = "$($pkgDir.Name)_"
+            }
+            $pkgPrograms++
+        }
+    }
+
+    foreach ($unit in $units) {
+        $src  = $unit.Src
+        $name = $unit.Name
+        $obj  = Join-Path $userBuild "$($unit.Prefix)$name.o"
+        $pe   = Join-Path $userBuild "$($unit.Prefix)$name.pe"
+        $bin  = Join-Path $userBuild "$($unit.Prefix)$name.bin"
+        $lxe  = Join-Path $unit.Out "$name.lxe"
 
         # 编译
         $code = Invoke-Tool -Exe $gcc -Arguments ($uflags + @($src.FullName, "-o", $obj)) -OnLine {
@@ -383,8 +440,110 @@ if (Test-Path $userDir) {
     }
 
     Write-Ok "$($programs.Count) 个用户程序"
+    if ($pkgPrograms -gt 0) {
+        Write-Ok "$pkgPrograms 个软件包内的程序（编译到 build\packages\，不进 /bin）"
+    }
 } else {
     Write-Host "    没有 user/ 目录，跳过用户程序编译" -ForegroundColor DarkGray
+}
+
+# --- 6b2. 打包软件包（.hnpkg）与仓库索引 -------------------
+#
+# packages\<名字>\ 是"源码包"：manifest.txt 描述它，src\*.c 是包里的程序，
+# files\ 是要原样装到目标路径的数据。这里把它们打成 fsroot\var\hpm\repo\
+# 下的 .hnpkg，再生成一个纯文本索引 —— 相当于在宿主机上维护一个本地源。
+# OS 里的 hpm 读的就是这个目录，所以"仓库"不需要网络。
+$pkgDirs = @()
+if (Test-Path $packagesDir) {
+    $pkgDirs = @(Get-ChildItem $packagesDir -Directory | Sort-Object Name)
+}
+
+if ($pkgDirs.Count -gt 0) {
+    Write-Step "[6b2] 打包软件包（.hnpkg）"
+
+    $packer = Join-Path $root "tools\mkhnpkg.ps1"
+    if (-not (Test-Path $packer)) { Fail "找不到打包器 $packer" }
+
+    New-Item -ItemType Directory -Force -Path $fsRepo | Out-Null
+    Get-ChildItem $fsRepo -Filter *.hnpkg -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+    Remove-Item (Join-Path $fsRepo "index") -Force -ErrorAction SilentlyContinue
+
+    $indexLines = @(
+        "# HNeoC 软件包索引 —— 由 build.ps1 生成，也可以进系统后跑 hpm update 重建",
+        "# name`tversion`tfile`tdepends`tsummary"
+    )
+    $packed = 0
+
+    foreach ($pkgDir in $pkgDirs) {
+        $manifest = Join-Path $pkgDir.FullName "manifest.txt"
+        if (-not (Test-Path $manifest)) {
+            Fail "$($pkgDir.Name)：没有 manifest.txt"
+        }
+
+        # manifest.txt 是 "键: 值" 的纯文本，空行和 # 开头当注释
+        $meta = @{}
+        foreach ($line in (Get-Content $manifest)) {
+            $t = $line.Trim()
+            if ($t -eq "" -or $t.StartsWith("#")) { continue }
+            $c = $t.IndexOf(":")
+            if ($c -lt 1) { continue }
+            $meta[$t.Substring(0, $c).Trim().ToLower()] = $t.Substring($c + 1).Trim()
+        }
+        if (-not $meta["name"] -or -not $meta["version"]) {
+            Fail "$($pkgDir.Name)：manifest.txt 里缺 name 或 version"
+        }
+
+        $pkgFile = "$($meta['name'])-$($meta['version']).hnpkg"
+        $pkgOut  = Join-Path $fsRepo $pkgFile
+        $pkgBin  = Join-Path $buildDir ("packages\" + $pkgDir.Name)
+
+        $code = Invoke-Tool -Exe "powershell" -Arguments @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", $packer,
+            "-PackageDir", $pkgDir.FullName,
+            "-OutputFile", $pkgOut,
+            "-BinDir", $pkgBin
+        )
+        if ($code -ne 0) { Fail "$($pkgDir.Name) 打包失败" }
+
+        # 索引直接从打好的包头里读回来：这样"索引里写的"和"包里写的"
+        # 必然是同一份数据，顺带在构建期就验证了包头能不能被解析。
+        # 偏移量必须和 user/lib/include/hnpkg.h 对齐。
+        $hdr = [System.IO.File]::ReadAllBytes($pkgOut)
+        if ($hdr.Length -lt 256) { Fail "$pkgFile 比包头还小（$($hdr.Length) 字节）" }
+        if ([BitConverter]::ToUInt32($hdr, 0) -ne 0x4B504E48) {
+            Fail "$pkgFile 的魔数不对，不是 'HNPK'"
+        }
+
+        $hName = [Text.Encoding]::ASCII.GetString($hdr, 8, 32).TrimEnd([char]0)
+        $hVer  = [Text.Encoding]::ASCII.GetString($hdr, 40, 16).TrimEnd([char]0)
+        $hDep  = [Text.Encoding]::ASCII.GetString($hdr, 56, 48).TrimEnd([char]0)
+        $hSum  = [Text.Encoding]::ASCII.GetString($hdr, 104, 96).TrimEnd([char]0)
+        $hCnt  = [BitConverter]::ToUInt32($hdr, 200)
+        $hData = [BitConverter]::ToUInt32($hdr, 204)
+        $hAll  = [BitConverter]::ToUInt32($hdr, 208)
+
+        if ($hName -ne $meta["name"]) {
+            Fail "$pkgFile 包头里的包名是 '$hName'，manifest 里写的是 '$($meta['name'])'"
+        }
+        if ($hCnt -eq 0) { Fail "$pkgFile 里一个文件都没有" }
+        if ($hData -lt 256 -or $hAll -ne $hdr.Length) {
+            Fail "$pkgFile 的 data_offset/total_size 不对（$hData / $hAll，文件 $($hdr.Length) 字节）"
+        }
+
+        $indexLines += ("{0}`t{1}`t{2}`t{3}`t{4}" -f $hName, $hVer, $pkgFile, $hDep, $hSum)
+        $packed++
+        Write-Ok ("{0,-10} {1,-6} {2,6} B  {3} 个文件" -f `
+            $hName, $hVer, $hdr.Length, $hCnt)
+    }
+
+    # 索引必须是无 BOM 的 UTF-8 + LF：hpm 在系统里是按字节解析的，
+    # 带 BOM 的话第一行会多出 EF BB BF，字段当场错位。
+    $indexText = ($indexLines -join "`n") + "`n"
+    [System.IO.File]::WriteAllText((Join-Path $fsRepo "index"), $indexText,
+        (New-Object System.Text.UTF8Encoding($false)))
+    Write-Ok "$packed 个软件包进了本地源（fsroot\var\hpm\repo）"
 }
 
 # --- 6c. 把 fsroot/ 里的文件打包成 HNeoFS -----------------
@@ -462,6 +621,37 @@ if ($programs -and $programs.Count -gt 0) {
     Write-Ok "HNeoFS 超级块正常，$($programs.Count) 个用户程序都在镜像里（共 $sbCount 个目录项）"
 } else {
     Write-Ok "HNeoFS 超级块正常（共 $sbCount 个目录项）"
+}
+
+# --- 软件包也必须真的进了镜像 --------------------------------
+#
+# 这一段是"包管理器能不能用"的第一道闸：.hnpkg 被 packer 生成在 fsroot 里，
+# 但如果 mkfs 没把它们打包进镜像（或者目录建漏了），系统里跑 hpm 只会看到
+# 一个空仓库，而且症状是"没有这个包"，很容易被当成命令写错了。
+if ($pkgDirs.Count -gt 0) {
+    $repoPkgs = @(Get-ChildItem $fsRepo -Filter *.hnpkg -ErrorAction SilentlyContinue)
+    if ($repoPkgs.Count -eq 0) {
+        Fail "packages\ 里有 $($pkgDirs.Count) 个源码包，但 fsroot\var\hpm\repo 里没有 .hnpkg"
+    }
+    if (-not $sbNames.ContainsKey("repo")) {
+        Fail ("镜像里没有 /var/hpm/repo 目录（HNeoFS 里没有 'repo' 这一项）。" +
+              "`n         hpm 会找不到仓库；检查 fsroot\var\hpm\repo\ 是否真的存在（空目录不会被打包，放一个 .keep）。")
+    }
+
+    $missingPkg = @()
+    foreach ($rp in $repoPkgs) {
+        if (-not $sbNames.ContainsKey($rp.Name.ToLower())) {
+            $missingPkg += $rp.Name
+        }
+    }
+    if (-not $sbNames.ContainsKey("index")) {
+        $missingPkg += "index"
+    }
+    if ($missingPkg.Count -gt 0) {
+        Fail ("镜像的 HNeoFS 里找不到这些仓库文件：{0}" -f ($missingPkg -join ", ")) +
+             "`n         检查 fsroot\var\hpm\repo\ 和 mkfs 的 -SourceDir。"
+    }
+    Write-Ok "$($repoPkgs.Count) 个 .hnpkg 和索引都在镜像里（共 $sbCount 个目录项）"
 }
 
 # 校验通过，临时镜像正式上岗。到这一行为止，原来那个 hneoc-os.img 一直没被动过。

@@ -419,6 +419,64 @@ static int32_t sys_sbrk(int32_t increment) {
     return process_sbrk(increment);
 }
 
+/* whoami：把 uid 和管理员标志一起带回去。
+ *
+ * 低位 16 位是 uid，bit16 是"是不是管理员"。本来想拆成两个系统调用，
+ * 但"我是谁"永远是一起问的，一个调用省一次陷入。
+ * 用户态用 user/lib 的 getuid() / is_admin() 拆开，别自己抠位。
+ */
+static int32_t sys_whoami(void) {
+    return (int32_t)((process_uid() & 0xFFFFu) |
+                     (process_is_admin() ? 0x10000u : 0u));
+}
+
+/* chmod：改权限位。
+ *
+ * 只有 root / 管理员 / 文件属主能改。mode 只取低 9 位（属主三位 + 其他人
+ * 三位，中间那组位留着不用）。
+ *
+ * 装包必须要它：hpm 把 .lxe 写进 /bin 时，新建的文件一律是默认的 0644，
+ * 没有执行位的话非 root 用户根本跑不起来。
+ * 顺手把执行位同步到 HNEOFS_FLAG_EXEC —— mkfs 打包时也是这么做的，
+ * 不然 ls 里显示的 kind 会和权限位对不上。
+ */
+static int32_t sys_chmod(uint32_t path_ptr, uint32_t mode) {
+    char path[HNEOFS_PATH_MAX];
+    hneofs_file_t* f;
+    int32_t idx;
+
+    if (!hneofs_mounted()) {
+        return HNEOFS_ERR_MOUNT;
+    }
+    if (!copy_user_string(path_ptr, path, sizeof(path))) {
+        return HNEOFS_ERR_NAME;
+    }
+
+    idx = hneofs_resolve(path);
+    if (idx < 0) {
+        return HNEOFS_ERR_NOENT;
+    }
+
+    f = hneofs_file_mut((uint32_t)idx);
+    if (!f) {
+        return HNEOFS_ERR_NOENT;
+    }
+
+    if (!process_is_admin() && f->uid != process_uid()) {
+        return HNEOFS_ERR_PERM;
+    }
+
+    mode &= 0x1FFu;
+    f->mode = mode;
+    if (mode & (HNEOFS_MODE_OWNER_EXEC | HNEOFS_MODE_OTHER_EXEC)) {
+        f->flags |= HNEOFS_FLAG_EXEC;
+    } else {
+        f->flags &= ~HNEOFS_FLAG_EXEC;
+    }
+
+    return hneofs_sync() ? 0 : HNEOFS_ERR_IO;
+}
+
 /* 创建一个目录 */
 static int32_t sys_mkdir(uint32_t path_ptr) {
     char path[HNEOFS_PATH_MAX];
@@ -727,6 +785,14 @@ void syscall_handler(registers_t* regs) {
 
         case SYS_GETCWD:
             ret = sys_getcwd(regs->ebx, regs->ecx);
+            break;
+
+        case SYS_CHMOD:
+            ret = sys_chmod(regs->ebx, regs->ecx);
+            break;
+
+        case SYS_WHOAMI:
+            ret = sys_whoami();
             break;
 
         case SYS_OPEN:
