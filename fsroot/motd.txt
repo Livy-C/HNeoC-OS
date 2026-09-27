@@ -1,0 +1,10 @@
+Welcome to HNeoC OS.
+
+This disk image was assembled by tools/mkfs.ps1, which walks fsroot/
+and packs it into an HNeoFS tree inside build/hneoc-os.img. Programs
+live in /bin; the root has the text files you are reading now.
+
+Every shell command is a separate executable loaded from /bin and run
+in ring 3 with int 0x80 syscalls.
+
+Type 'help' for the list of commands.

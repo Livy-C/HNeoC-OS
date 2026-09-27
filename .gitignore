@@ -1,0 +1,37 @@
+# 构建输出
+build/
+*.img
+*.bin
+*.o
+*.pe
+*.elf
+*.vdi
+
+# build.ps1 从 user/*.c 生成的可执行文件（会写进源码树里的 fsroot/bin/）
+*.lxe
+fsroot/bin/
+
+# 调试产物
+*.map
+*.sym
+vmcore.*
+*.png
+
+# 编译中间文件
+*.d
+*.out
+
+# 日志
+*.log
+
+# 编辑器和 IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 临时文件
+tmp/
+temp/
