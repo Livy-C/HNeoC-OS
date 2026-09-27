@@ -195,7 +195,8 @@ typedef struct {
 | `ansi` | `ansi.lxe` | ANSI 转义序列演示：定位、颜色、擦除、滚动区域、备用屏幕 |
 | `vi` | `vi.lxe` | 全屏模态编辑器（见下） |
 | `wtest` | `wtest.lxe` | 可写文件系统自测：创建、写入、定位读、追加、删除 |
-| `systest` | `systest.lxe` | 系统调用边界自测：readfile 的 max 参数校验（故意传未映射地址） |
+| `systest` | `systest.lxe` | 系统调用边界自测：readfile 的 max、lseek 的偏移量（故意越界） |
+| `fault` | `fault.lxe` | 故意触发用户态缺页，验证内核只杀进程而不停机 |
 | `note` | `note.lxe` | 往 notes.txt 追加一行，用来验证数据真的落盘 |
 | `termdemo` | `termdemo.lxe` | term.h 终端 API 示例：固定状态栏 + 滚动区域 + 进度条 |
 

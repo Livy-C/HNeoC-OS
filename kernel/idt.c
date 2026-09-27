@@ -87,8 +87,38 @@ static void vga_write_hex32(uint32_t value) {
  * 的就是那个任务的寄存器现场 —— 上下文切换就是这么完成的。
  */
 uint32_t isr_handler(registers_t* regs) {
-    /* 中断号 0-31 属于 CPU 异常，通常无法恢复 */
+    /* 中断号 0-31 属于 CPU 异常。 */
     if (regs->int_no < 32) {
+        process_t* p = process_current();
+
+        /* 发生在 ring 3 的异常是用户程序自己的 bug（空指针、除零、越界），
+         * 没有任何理由让整个系统陪葬：把这个进程杀掉，照常调度下一个任务，
+         * Shell 拿回提示符就好。
+         * 内核态异常仍然停机 —— 那是内核自己的问题，硬撑下去只会更糟。
+         */
+        if ((regs->cs & 3) == 3 && p && p->pid != 0) {
+            vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+            vga_write("process '");
+            vga_write(p->name);
+            vga_write("' killed: ");
+            vga_writeln(exception_messages[regs->int_no]);
+            vga_write("   EIP ");
+            vga_write_hex32(regs->eip);
+            if (regs->int_no == 14) {
+                vga_write("   CR2 ");
+                vga_write_hex32(paging_fault_address());
+            }
+            vga_writeln("");
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+
+            process_exit_current(-1);
+
+            /* force_switch 已经由 process_exit_current 置位，所以这个非时钟中断
+             * 也会真的换人；返回的是下一个任务的内核栈指针，不会再回到这里。
+             */
+            return sched_tick(regs);
+        }
+
         vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_RED);
         vga_clear();
         vga_writeln("");

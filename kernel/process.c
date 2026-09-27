@@ -371,16 +371,6 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
     return p;
 }
 
-/* 关中断地构造进程，构造完再恢复调用前的中断状态 */
-static process_t* create_from_image(const char* filename, const uint8_t* image,
-                                    uint32_t size) {
-    uint32_t flags = irq_save();
-    process_t* p = create_from_image_locked(filename, image, size);
-
-    irq_restore(flags);
-    return p;
-}
-
 /* 从文件系统读出一个 LXE 并创建进程 */
 static process_t* load_program(const char* filename, const char* args, int* err) {
     const hneofs_file_t* f;
@@ -416,18 +406,36 @@ static process_t* load_program(const char* filename, const char* args, int* err)
         return NULL;
     }
 
-    p = create_from_image(filename, image, (uint32_t)got);
-    kfree(image);
+    /* 从构造到"参数拷好、映像缓冲区释放掉"之间必须一直关着中断。
+     *
+     * create_from_image_locked 返回时新任务已经是 PROC_READY 了，
+     * 只要 irq_restore 一执行，时钟中断就能立刻把它切上去跑；而此刻它的
+     * 命令行参数还没拷（getargs 会读到半成品），内核还在动那块映像缓冲区。
+     * 这个窗口是真实存在的：串口插桩时抓到过切换就发生在参数拷贝之前
+     * （[LP2] 和 [SW] 挤在同一行输出里）。
+     *
+     * 所以把参数拷贝和 kfree 一起放进关中断区间，等一切就绪再放它跑。
+     * 这段没有磁盘 I/O，关中断的时间很短。
+     */
+    {
+        uint32_t flags = irq_save();
+
+        p = create_from_image_locked(filename, image, (uint32_t)got);
+
+        /* 命令行参数交给进程自己保管，程序通过 getargs 系统调用取 */
+        if (p && args) {
+            strncpy(p->args, args, PROCESS_ARGS_MAX - 1);
+            p->args[PROCESS_ARGS_MAX - 1] = '\0';
+        }
+
+        kfree(image);
+
+        irq_restore(flags);
+    }
 
     if (!p) {
         *err = -5;
         return NULL;
-    }
-
-    /* 命令行参数交给进程自己保管，程序通过 getargs 系统调用取 */
-    if (args) {
-        strncpy(p->args, args, PROCESS_ARGS_MAX - 1);
-        p->args[PROCESS_ARGS_MAX - 1] = '\0';
     }
 
     *err = 0;
@@ -729,6 +737,11 @@ int process_run(const char* filename, const char* args) {
      * 我们下面马上就把槽位标成 UNUSED，reap_zombies 再也不会看它一眼 ——
      * 那 8KB 内核栈就永远漏掉了（紧接着 alloc_slot 会把槽位 memset 掉，
      * 连指针一起丢）。所以在这里自己释放，和 reap_zombies 做的一样。
+     *
+     * 这一条不是洁癖：实测把这段去掉（故意留泄漏）之后，重复运行前台程序
+     * 到第 8~9 次就会让虚拟机直接 Guru Meditation 崩掉，堆里的内核栈
+     * 地址一路从 0x101F40 涨到 0x10FFE8。释放掉之后，同一个负载跑 25 次
+     * 都没事（栈块被复用，堆不再单调增长）。
      *
      * 关中断是为了别让时钟中断插在"释放栈"和"标记 UNUSED"之间：
      * 否则 reap_zombies 可能对同一个指针再释放一次。

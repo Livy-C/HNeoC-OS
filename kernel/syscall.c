@@ -238,7 +238,16 @@ static int32_t sys_lseek(int32_t fd, int32_t offset, int32_t whence) {
     }
 
     target = base + offset;
-    if (target < 0) {
+
+    /* 上界必须卡住，不能只挡住负数。
+     *
+     * 偏移量会原样存进 fd，之后的 write 直接把 start_lba + offset/512 当作 LBA
+     * 来用：一个越界的偏移量就等于"往任意扇区写"的原语，能写到超级块、文件表
+     * 或者别的文件的数据上，而且只更新本次文件自己的 size，事后完全看不出来。
+     * 读也一样，能读到磁盘任意位置。这个文件系统没有稀疏文件的概念，
+     * "越过文件末尾"没有任何合法用途，直接拒绝。
+     */
+    if (target < 0 || target > (int32_t)f->size) {
         return -1;
     }
 

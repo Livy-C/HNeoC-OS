@@ -693,6 +693,16 @@ int32_t hneofs_write_at(uint32_t index, uint32_t offset,
     }
 
     f = &file_table[index];
+
+    /* offset + size 回绕的话，下面算出来的 need_sectors 会比实际需要的小，
+     * ensure_capacity 就不会扩容，而写入仍然落在 offset 对应的 LBA 上 ——
+     * 相当于拿到一个"任意扇区写"的原语。sys_lseek 那边已经在源头卡了偏移量，
+     * 这里是第二道防线。
+     */
+    if (offset > 0xFFFFFFFFu - size) {
+        return HNEOFS_ERR_NOSPC;
+    }
+
     new_size = offset + size;
     need_sectors = (new_size + HNEOFS_BLOCK_SIZE - 1) / HNEOFS_BLOCK_SIZE;
     if (need_sectors == 0) {
