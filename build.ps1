@@ -27,6 +27,10 @@ $buildDir = Join-Path $root "build"
 $imgFile  = Join-Path $buildDir "hneoc-os.img"
 $vdiFile  = Join-Path $buildDir "hneoc-os.vdi"
 
+# 镜像先构建到这个临时文件，等 [6d] 的断言全部通过之后才改名成 $imgFile。
+# 这样构建中途出错、或者被 Ctrl+C 打断时，上次那个完好的镜像不会被半成品覆盖。
+$imgTmp   = Join-Path $buildDir "hneoc-os.building.img"
+
 function Write-Step($text) {
     Write-Host "  $text" -ForegroundColor Cyan
 }
@@ -236,8 +240,9 @@ $image = New-Object byte[] ($imageSectors * 512)
 [Array]::Copy($bootBytes, 0, $image, 0, $bootBytes.Length)
 [Array]::Copy($kernelBytes, 0, $image, 512, $kernelBytes.Length)
 
-[System.IO.File]::WriteAllBytes($imgFile, $image)
-Write-Ok "hneoc-os.img (8 MB, 16384 sectors)"
+# 先写临时文件：校验通过才改名成 hneoc-os.img（见 [6d]）
+[System.IO.File]::WriteAllBytes($imgTmp, $image)
+Write-Ok "临时镜像 (8 MB, 16384 sectors)"
 
 # --- 6b. 编译用户程序并放进 fsroot/ -------------------------
 $userDir = Join-Path $root "user"
@@ -330,17 +335,35 @@ if (Test-Path $userDir) {
         }
         if ($code -ne 0) { Fail "$($src.Name) 链接失败" }
 
-        # 从符号表里取 .bss 的起止地址，算出 LXE 头部需要的 bss_size
-        Invoke-Tool -Exe $nmExe -Arguments @($pe) | Out-Null
+        # 从符号表里取 .bss 的起止地址，算出 LXE 头部需要的 bss_size。
+        #
+        # 这里必须检查 nm 的退出码、以及符号是否真的找到了：nm.exe 缺失或改名时，
+        # 下面两个正则一条都匹配不上，$bssSize 会静默变成 0，用户程序的 .bss
+        # 就永远不会被清零 —— 构建输出里看不出任何异常，只在运行时变成玄学 bug。
+        if (-not (Test-Path $nmExe)) {
+            Fail "找不到 nm.exe：$nmExe（MinGW 的 nm，用来读 .bss 的大小）"
+        }
+        $code = Invoke-Tool -Exe $nmExe -Arguments @($pe)
+        if ($code -ne 0) { Fail "$($src.Name) 读符号表失败（nm 退出码 $code）" }
+
         $bssStart = [uint32]0
         $bssEnd   = [uint32]0
+        $bssSeen  = $false
         foreach ($line in $script:ToolOutput) {
             if ($line -match '^([0-9a-fA-F]+)\s+\S\s+_ubss_start') {
                 $bssStart = [Convert]::ToUInt32($Matches[1], 16)
+                $bssSeen  = $true
             }
             if ($line -match '^([0-9a-fA-F]+)\s+\S\s+_ubss_end') {
-                $bssEnd = [Convert]::ToUInt32($Matches[1], 16)
+                $bssEnd   = [Convert]::ToUInt32($Matches[1], 16)
+                $bssSeen  = $true
             }
+        }
+        if (-not $bssSeen) {
+            Fail "$($src.Name) 的符号表里既没有 _ubss_start 也没有 _ubss_end，bss_size 会算错"
+        }
+        if ($bssEnd -lt $bssStart) {
+            Fail "$($src.Name) 的 _ubss_end ($bssEnd) 小于 _ubss_start ($bssStart)"
         }
         $bssSize = $bssEnd - $bssStart
 
@@ -369,12 +392,81 @@ if (Test-Path $fsRoot) {
     $mkfs = Join-Path $root "tools\mkfs.ps1"
     $code = Invoke-Tool -Exe "powershell" -Arguments @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $mkfs,
-        "-Image", $imgFile, "-SourceDir", $fsRoot
-    )
+        "-Image", $imgTmp, "-SourceDir", $fsRoot
+    ) -OnLine {
+        param($line)
+        if ($line -notmatch '^\s*$') { Write-Host "      $line" -ForegroundColor DarkGray }
+    }
     if ($code -ne 0) { Fail "打包文件系统失败" }
 } else {
     Write-Host "    没有 fsroot/ 目录，跳过文件系统打包" -ForegroundColor DarkGray
 }
+
+# --- 6d. 校验镜像，通过之后才让它上岗 ------------------------
+# 宁可在这里停下，也不要产出一个"能启动、但没有文件系统"的镜像。
+#
+# 两道防线：
+#   1) 镜像是先写到 $imgTmp 的，只有下面这些断言全部通过，才改名成 hneoc-os.img。
+#      所以构建中途报错、或者被 Ctrl+C / 关窗口打断时，磁盘上上次构建好的那个
+#      镜像原封不动，不会被一个半成品覆盖。
+#   2) 断言会核对超级块魔数、目录项数量，以及每个刚编译出来的程序是否真的在
+#      镜像里。注意 "OK 10 个用户程序" 只说明编译了 10 个，不代表它们进了镜像。
+Write-Step "[6d] 校验镜像"
+
+if (-not (Test-Path $imgTmp)) {
+    Fail "没有生成 $imgTmp"
+}
+
+$imgBytes = [System.IO.File]::ReadAllBytes($imgTmp)
+$sbOffset = 2048 * 512          # HNEOFS_START_LBA * 512，见 include/hneofs.h
+$HNFS_MAGIC = [uint32]0x53464E48   # 'HNFS'，与 include/hneofs.h 的 HNEOFS_MAGIC 一致（PowerShell 不认 C 的 u 后缀）
+
+if ($imgBytes.Length -lt ($sbOffset + 512)) {
+    Fail "镜像只有 $($imgBytes.Length) 字节，连 HNeoFS 超级块的位置都到不了"
+}
+
+$sbMagic = [BitConverter]::ToUInt32($imgBytes, $sbOffset)
+if ($sbMagic -ne $HNFS_MAGIC) {
+    Fail (("LBA 2048 处的魔数是 0x{0:X8}，应该是 0x{1:X8} ('HNFS')。" -f $sbMagic, $HNFS_MAGIC) +
+          "`n         文件系统没有被写进镜像，这个镜像能启动但不会加载任何用户程序。" +
+          "`n         （mkfs 那一步没跑到：检查上面 [6c] 是否报错、脚本是否被中断。）")
+}
+
+$sbCount    = [BitConverter]::ToUInt32($imgBytes, $sbOffset + 16)
+$sbTableLba = [BitConverter]::ToUInt32($imgBytes, $sbOffset + 20)
+
+if ($sbCount -lt 1) {
+    Fail "HNeoFS 超级块存在，但目录项是 0 个：fsroot/ 是空的，或者源码目录走错了"
+}
+
+# 把镜像里真实存在的文件名收集出来，逐个核对刚编译好的程序
+$sbNames = @{}
+for ($i = 0; $i -lt $sbCount; $i++) {
+    $o = ($sbTableLba * 512) + ($i * 64)
+    if ($o + 32 -gt $imgBytes.Length) { break }
+    $nm = [System.Text.Encoding]::ASCII.GetString($imgBytes, $o, 32).TrimEnd([char]0)
+    if ($nm.Length -gt 0) { $sbNames[$nm.ToLower()] = $true }
+}
+
+if ($programs -and $programs.Count -gt 0) {
+    $missing = @()
+    foreach ($prog in $programs) {
+        if (-not $sbNames.ContainsKey("$($prog.BaseName).lxe".ToLower())) {
+            $missing += "$($prog.BaseName).lxe"
+        }
+    }
+    if ($missing.Count -gt 0) {
+        Fail ("镜像的 HNeoFS 里找不到这些程序：{0}" -f ($missing -join ", ")) +
+             "`n         编译出来的 .lxe 没有进到镜像里（检查 fsroot/bin/ 和 mkfs 的 -SourceDir）。"
+    }
+    Write-Ok "HNeoFS 超级块正常，$($programs.Count) 个用户程序都在镜像里（共 $sbCount 个目录项）"
+} else {
+    Write-Ok "HNeoFS 超级块正常（共 $sbCount 个目录项）"
+}
+
+# 校验通过，临时镜像正式上岗。到这一行为止，原来那个 hneoc-os.img 一直没被动过。
+Move-Item -Force $imgTmp $imgFile
+Write-Ok "hneoc-os.img 已更新"
 
 # --- 可选：转换为 VirtualBox 磁盘 ---------------------------
 $vdiCreated = $false
