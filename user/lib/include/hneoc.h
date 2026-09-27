@@ -52,6 +52,7 @@
 #define SYS_SBRK      21
 #define SYS_MKDIR     22
 #define SYS_GETARGS   23
+#define SYS_GETCWD    24
 
 /* ============================================================
  * 系统调用原语

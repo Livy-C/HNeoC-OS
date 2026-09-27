@@ -44,8 +44,9 @@
 /* 目录与参数 */
 #define SYS_MKDIR     22   /* mkdir(path) -> 0，失败返回负的错误码 */
 #define SYS_GETARGS   23   /* getargs(buf, max) -> 拷贝出来的字节数 */
+#define SYS_GETCWD    24   /* getcwd(buf, max) -> 路径长度 */
 
-#define SYS_COUNT     24
+#define SYS_COUNT     25
 
 /* 目录遍历的返回值里，用 bit30 表示"这是个目录"。
  *

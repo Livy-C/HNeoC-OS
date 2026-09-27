@@ -139,6 +139,19 @@ for ($i = 0; $i -lt $entries.Count; $i++) {
     [BitConverter]::GetBytes([uint32]0).CopyTo($table, $base + 44)   # entry_offset
     [BitConverter]::GetBytes([uint32]$e.Type).CopyTo($table, $base + 48)
     [BitConverter]::GetBytes([uint32]$e.Parent).CopyTo($table, $base + 52)
+
+    # Permission bits and owner uid. These occupy what used to be
+    # reserved[2], so the 64-byte entry size is unchanged.
+    #   directories and .lxe -> 0755, plain files -> 0644, owner uid = 0 (root)
+    $mode = 0x1A4                                     # 0644
+    if ($e.Type -eq $TYPE_DIR) { $mode = 0x1ED }      # 0755
+    if ($e.Full -like "*.lxe") { $mode = 0x1ED }      # 0755
+    # /home is shared by every non-root account and there are no groups or
+    # per-user dirs yet, so make it world-writable like /tmp. Accounts added
+    # later with `useradd` get their own /home/<name> owned by themselves.
+    if ($e.Type -eq $TYPE_DIR -and $e.Name -eq "home") { $mode = 0x1FF }  # 0777
+    [BitConverter]::GetBytes([uint32]$mode).CopyTo($table, $base + 56)
+    [BitConverter]::GetBytes([uint32]0).CopyTo($table, $base + 60)   # uid = root
 }
 
 # --- build the superblock -----------------------------------

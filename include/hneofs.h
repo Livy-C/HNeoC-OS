@@ -46,6 +46,32 @@
 #define HNEOFS_FLAG_EXEC    0x0001   /* 可以直接执行 */
 #define HNEOFS_FLAG_TEXT    0x0002   /* 纯文本，cat 友好 */
 
+/* 权限位。借用 Unix 的三组三位写法，但这里只区分"属主"和"其他人"
+ * （没有用户组的概念），所以中间那三位（组）不参与判断。
+ *   0755 = 属主可读写执行，其他人可读可执行
+ *   0644 = 属主可读写，其他人只读
+ */
+#define HNEOFS_MODE_OWNER_EXEC   0x040u   /* 0100 */
+#define HNEOFS_MODE_OWNER_WRITE  0x080u   /* 0200 */
+#define HNEOFS_MODE_OWNER_READ   0x100u   /* 0400 */
+#define HNEOFS_MODE_OTHER_EXEC   0x001u   /* 0001 */
+#define HNEOFS_MODE_OTHER_WRITE  0x002u   /* 0002 */
+#define HNEOFS_MODE_OTHER_READ   0x004u   /* 0004 */
+
+/* 权限检查里"想要什么"的编码。
+ *
+ * 注意：这不是掩码，是位序号 2/1/0 上的值 —— hneofs_access 会把它左移 6 位
+ * 去对属主的那三位、直接拿去对"其他人"的那三位，所以读=4、写=2、执行=1，
+ * 顺序和 Unix 三位一样。想给掩码的地方用上面的 HNEOFS_MODE_*，两者别混。
+ */
+#define HNEOFS_ACCESS_EXEC   1u   /* 0100/0001 位 */
+#define HNEOFS_ACCESS_WRITE  2u   /* 0200/0002 位 */
+#define HNEOFS_ACCESS_READ   4u   /* 0400/0004 位 */
+
+/* 新建文件/目录时用的默认权限 */
+#define HNEOFS_MODE_DEFAULT_FILE  0x1A4u   /* 0644 */
+#define HNEOFS_MODE_DEFAULT_DIR   0x1EDu   /* 0755 */
+
 /* 打开标志 */
 #define HNEOFS_O_RDONLY  0x0000
 #define HNEOFS_O_WRONLY  0x0001
@@ -65,6 +91,7 @@
 #define HNEOFS_ERR_NOTDIR  (-8)   /* 中间某一段不是目录 */
 #define HNEOFS_ERR_ISDIR   (-9)   /* 是目录，不能这样操作 */
 #define HNEOFS_ERR_NOTEMPTY (-10) /* 目录非空，不能删 */
+#define HNEOFS_ERR_PERM     (-11) /* 权限不够 */
 
 /* 目录项：64 字节，一个扇区正好放 8 个 */
 typedef struct {
@@ -75,7 +102,8 @@ typedef struct {
     uint32_t entry_offset;           /* 可执行文件的入口偏移，通常为 0 */
     uint32_t type;                   /* HNEOFS_TYPE_FILE / HNEOFS_TYPE_DIR */
     uint32_t parent;                 /* 父目录的下标；HNEOFS_ROOT 表示根目录下 */
-    uint32_t reserved[2];            /* 预留，补齐到 64 字节 */
+    uint32_t mode;                   /* 权限位，见下面的 HNEOFS_MODE_* */
+    uint32_t uid;                    /* 属主 uid，0 = root */
 } __attribute__((packed)) hneofs_file_t;
 
 /* 超级块：512 字节 */
@@ -111,6 +139,9 @@ hneofs_file_t* hneofs_file_mut(uint32_t index);
  */
 int32_t hneofs_resolve(const char* path);
 
+/* 把目录下标还原成绝对路径（Shell 提示符、cd 用）。失败返回 false */
+bool hneofs_path_of(uint32_t index, char* out, uint32_t max);
+
 /* 按路径取目录项；等价于先 resolve 再 file */
 const hneofs_file_t* hneofs_lookup(const char* path);
 
@@ -132,6 +163,11 @@ uint32_t hneofs_child_count(uint32_t dir_index);
 /* ------------------------------------------------------------
  * 读取
  * ------------------------------------------------------------ */
+/* 检查 uid 对目录项 f 有没有 want（上面那几个模式位之一或组合）的权限。
+ * uid 0（root）一律放行；属主看高三位，其他人看低三位。
+ */
+bool hneofs_access(const hneofs_file_t* f, uint32_t uid, uint32_t want);
+
 int32_t hneofs_read_at(const hneofs_file_t* f, uint32_t offset,
                        void* buffer, uint32_t size);
 int32_t hneofs_read_file(const hneofs_file_t* f, void* buffer, uint32_t buffer_size);

@@ -5,23 +5,27 @@
 **当前版本：0.3.0**
 
 它已经不是一个玩具 Demo 了：有物理内存管理、分页、ATA 磁盘驱动、自己的文件
-系统、ring 3 用户态、系统调用、抢占式多任务调度，以及一个任务管理器。
-Shell 里的每条命令都是磁盘上一个独立的可执行文件。
+系统、ring 3 用户态、系统调用、抢占式多任务调度、多用户账户与文件权限，
+以及一个任务管理器。Shell 里的每条命令都是磁盘上一个独立的可执行文件。
 
 ```
-hneoc> ls
-HNeoFS directory
+login: root
+Password: ****
+welcome, root (admin)
+hneoc$root~/ ls
+HNeoFS  /
 --------------------------------------------------
   name                 size      kind
-  bg.lxe               244     B  exec
-  hello.lxe            1140    B  exec
-  ls.lxe               1364    B  exec
-  readme.txt           707     B  data
-  ver.lxe              1020    B  exec
+  bg.lxe               160     B  exec
+  etc                    -        dir
+  hello.lxe            1192    B  exec
+  home                   -        dir
+  readme.txt           1114    B  data
 --------------------------------------------------
-  5 files
+  ...
 
-hneoc> taskmgr
+hneoc$root~/ cd /home
+hneoc$root~/home taskmgr
 Task manager
 --------------------------------------------------------------------------
   pid  name             state     kind    memory    cpu   syscalls
@@ -32,6 +36,9 @@ Task manager
   syscalls total : 235
   free frames    : 27 MB
 ```
+
+提示符是 `hneoc$` + 用户名 + `~` + 工作目录，`$` 和 `~` 是字面字符
+（`hneoc$guest~/home` 表示当前用户在 `/home`）。
 
 ---
 
@@ -187,7 +194,7 @@ typedef struct {
 
 | 命令 | 文件 | 说明 |
 |------|------|------|
-| `ls` | `ls.lxe` | 列出文件系统目录 |
+| `ls` | `ls.lxe` | 列出目录（不带参数就是当前工作目录） |
 | `ver` | `ver.lxe` | 版本与运行环境信息 |
 | `hello` | `hello.lxe` | 最小的用户态示例，验证 bss 清零和系统调用 |
 | `sysinfo` | `sysinfo.lxe` | 实时刷新运行时长，按 q 退出 |
@@ -208,9 +215,9 @@ typedef struct {
 "行数组"结构：每行存原始内容，另存一份把 tab 展开后的版本用于显示。
 
 ```text
-hneoc> vi
+hneoc$root~/ vi
 （欢迎屏，~ 表示空行）
-hneoc> :e motd.txt
+（在编辑器里敲 :e motd.txt）
 （文件内容 + 状态栏 -- NORMAL --）
         motd.txt  9/9                                  -- NORMAL --
 ```
@@ -238,7 +245,7 @@ hneoc> :e motd.txt
 实测（打开 → 跳末尾 → 开新行 → 输入 → 保存 → 退出 → 用 cat 核对）：
 
 ```text
-hneoc> cat edited.txt
+hneoc$root~/ cat edited.txt
 Welcome to HNeoC OS.
 ...
 Type 'help' for the list of commands.
@@ -320,13 +327,17 @@ int main(void) {
 | 命令 | 说明 |
 |------|------|
 | `help` | 命令列表 |
+| `cd <目录>` / `pwd` | 切换 / 显示工作目录，支持 `.` `..` 和相对路径 |
+| `ls` / `cat <f>` | 目录与文件内容 |
+| `mkdir <目录>` / `rm <文件>` | 建目录 / 删文件（都要父目录可写） |
+| `whoami` / `users` | 当前账户 / 账户表 |
+| `useradd <名字>` / `login` | 加账户（仅管理员） / 重新登录 |
 | `mem` | E820 内存表、页框分配器、内核堆、分页状态 |
 | `heap` | 内存分配器自检 |
 | `diskinfo` | ATA 设备信息，并实测一次 PIO 读 |
 | `mouse` | PS/2 鼠标状态和回滚缓冲统计 |
 | `screendump [colors]` | 把屏幕内容打出来（含逐格配色），调试验证用 |
 | `fsstat` | 文件系统超级块与空间占用 |
-| `ls` / `cat <f>` | 目录与文件内容 |
 | `exec <p>` | 前台运行程序，阻塞到退出 |
 | `spawn <p>` | 后台启动程序 |
 | `taskmgr` | 任务列表、CPU、内存、系统调用统计 |
@@ -364,6 +375,72 @@ VGA 显存只是它的一个"投影"。翻页时整屏重绘成历史内容，
 
 ---
 
+## 账户、目录与权限
+
+开机先登录，或者随时用 `login` 换一个身份（换完 Shell 提示符和权限都跟着变）：
+
+```text
+login: guest
+Password: *****
+welcome, guest
+hneoc$guest~/home whoami
+guest   uid 1001
+```
+
+账户表在 `/etc/passwd`，一行一个账户，字段用冒号分开：
+
+```text
+name:password_hash:uid:home:admin
+root:7c9d79a9:0:/:1
+livy:7c9a16c9:1000:/home:1
+guest:0f88c14d:1001:/home:0
+```
+
+镜像里预置了三个账户（`root`/`root`、`livy`/`livy`、`guest`/`guest`）。
+`admin = 1` 表示管理员：能加账户、能往别的用户的地盘写。uid 0 永远是 root。
+口令只在表里存一个 djb2 哈希值 —— **这不是安全措施**：没有盐、算法公开，
+而且谁有权限写 `/etc/passwd` 谁就能给自己加个账户。它的唯一作用是别让明文
+口令躺在磁盘上，配合教学镜像的定位。
+
+权限位借用 Unix 的三组三位写法，但**中间那三位（组）不参与判断**，因为这里
+没有用户组：
+
+| 权限 | 数值 | 含义 |
+|------|------|------|
+| `0755` | `0x1ED` | 属主可读写执行，其他人可读可执行（目录、`.lxe`） |
+| `0644` | `0x1A4` | 属主可读写，其他人只读（普通文件） |
+| `0777` | `0x1FF` | 谁都可读写（`/home`，见下） |
+
+判断规则：`uid == 0` 或者 `admin` 一律放行；属主看高三位，其他人看低三位。
+根目录**没有自己的目录项**，所以"往 `/` 里写"一律要求管理员 —— 相当于 Unix
+里 `/` 属于 root。`/home` 特意做成 `0777`：现在还没有用户组，也没有
+"每个用户一个私有目录"的机制，让所有用户都能在这里建自己的目录是最省事的
+做法（`useradd` 建出来的 `/home/<名字>` 会 chown 给新账户）。
+
+检查点放在**文件系统这一层**（`create_entry` / `hneofs_unlink` /
+`hneofs_write_at`），而不是只放在系统调用里 —— Shell 的内置命令是直接调
+`hneofs_*` 的，只在 `int 0x80` 那一层查的话，`mkdir` `rm` 这些内置命令
+就成了后门。
+
+身份跟着进程走：`process_t` 里有 `uid`、`admin`、`cwd`，`fork`/`spawn` 出来的
+程序继承父进程这一套，所以"谁在跑这个程序"始终是明确的。目录解析
+（`hneofs_resolve`）认相对路径、`.` 和 `..`，相对路径的基准就是进程的 `cwd`；
+用户态程序想知道自己在哪个目录，用 `getcwd()` 系统调用问内核。
+
+实测过的一组（都是真实虚拟机 + 串口日志里核对过的）：
+
+| 操作 | 结果 |
+|------|------|
+| root 在 `/home` 里 `mkdir d1`、`cd d1`、`cd ..` | 成功，提示符跟上 `hneoc$root~/home/d1` |
+| guest 在 `/home` 里 `mkdir mine`、`note` 写文件、`rm mine` | 成功，新文件属主是 uid 1001 |
+| guest `mkdir /nope` | `mkdir: permission denied` |
+| guest `rm /motd.txt` | `rm: cannot remove /motd.txt`（`/` 不归他） |
+| guest 用 `vi` 改 `/etc/passwd` 再 `:wq` | `cannot open for writing`，留在编辑器里不丢改动，`:q!` 才退出；文件内容原样 |
+| guest `useradd hacker` | `useradd: only an administrator can add accounts` |
+| root `useradd tester` → 用 tester 登录 | `created account tester`，之后提示符 `hneoc$tester~/home/tester` |
+
+---
+
 ## 系统调用
 
 用户程序用 `int 0x80` 陷入内核，调用号在 EAX，参数在 EBX/ECX/EDX，
@@ -382,7 +459,7 @@ DPL=3 让 ring 3 能调用；interrupt gate 会清 IF，避免系统调用返回
 | 6 / 7 | `uptime()` / `ticks()` | 时间 |
 | 8 / 9 | `set_color` / `clear_screen` | 控制台 |
 | 10 | `readfile(name, buf, max)` | 一次性读整个文件 |
-| 11 | `listfiles(idx, buf, max)` | 遍历目录 |
+| 11 | `listdir(path, idx, buf, max)` | 遍历目录，bit30 表示"这是目录" |
 | 12 | `open(name, flags)` | 打开 / 创建文件，返回 fd |
 | 13 | `close(fd)` | 关闭 |
 | 14 | `read(fd, buf, len)` | 从文件或控制台读 |
@@ -393,6 +470,12 @@ DPL=3 让 ring 3 能调用；interrupt gate 会清 IF，避免系统调用返回
 | 19 | `getkey()` | 原始按键码，含方向键等 0x101+ |
 | 20 | `winsize()` | 屏幕尺寸打包成 `(行 << 8) \| 列` |
 | 21 | `sbrk(n)` | 把用户堆顶往上推，返回原来的堆顶 |
+| 22 | `mkdir(path)` | 建目录（要求父目录可写） |
+| 23 | `getargs(buf, max)` | 取命令行参数（命令名之后那段文本） |
+| 24 | `getcwd(buf, max)` | 取当前工作目录 |
+
+一共 25 个（`SYS_COUNT`），调用号在 `include/syscall.h` 和用户态的
+`user/lib/include/hneoc.h` 里各定义一份，**加调用时必须两边一起改**。
 
 fd 0/1/2 固定映射到控制台，其余从 3 开始分配，每个进程一张表（16 个）。
 进程退出时这张表自动作废。
@@ -419,7 +502,7 @@ fd 0/1/2 固定映射到控制台，其余从 3 开始分配，每个进程一�
 `user/ansi.c` 是完整的演示程序。验证渲染结果用 `screendump`：
 
 ```text
-hneoc> screendump colors
+hneoc$root~/ screendump colors
    0         1         2         3         4         5         6         7
    0123456789012345678901234567890123456789012345678901234567890123456789012 345
  0|  ANSI escape sequences work                                                |
@@ -442,7 +525,7 @@ attribute runs (row: cols fg/bg), only for non-default cells:
 写入时如果需要更大的空间，就把内容整体搬到新位置、旧区间自动变成空闲。
 
 ```text
-hneoc> wtest
+hneoc$root~/ wtest
 [1] create + write
   open = 3
   write #1 = 39
@@ -517,8 +600,9 @@ hneoc-os/
 │   ├── pmm.c              物理页框分配器（位图）
 │   ├── heap.c             内核堆 kmalloc/kfree
 │   ├── paging.c           页目录、用户页表
-│   ├── hneofs.c         文件系统
+│   ├── hneofs.c           文件系统（目录树、extent、权限检查）
 │   ├── process.c          进程与抢占式调度器
+│   ├── user.c             账户：登录、djb2 口令哈希、加账户
 │   ├── syscall.c          int 0x80 处理
 │   └── shell.c            命令行
 ├── drivers/
@@ -526,11 +610,14 @@ hneoc-os/
 ├── lib/string.c
 ├── include/               头文件
 ├── user/
-│   ├── hneoc.h           用户态运行时（系统调用包装）
+│   ├── lib/               用户态 C 库：include/ 头文件 + src/ 薄封装
 │   ├── crt0.asm           入口
 │   ├── user.ld            用户程序链接脚本（0x40000000）
-│   └── *.c                用户程序
+│   └── *.c                用户程序（ls / vi / wtest / systest / fault ...）
 ├── fsroot/                被打包进镜像的文件（自动生成 .lxe）
+│   ├── bin/               用户程序
+│   ├── etc/passwd         账户表（文本，可读可改）
+│   └── home/.keep         /home 的占位文件，保证这个目录存在于镜像里
 ├── tools/
 │   ├── nasm.exe  mkfs.ps1  mklxe.ps1  vm-type.ps1  vga-dump.ps1
 ├── build.ps1  run.ps1
@@ -665,13 +752,41 @@ hneoc-os/
     整体前移，所以写入相关的接口一律用下标而不是指针，
     而且调用方在下标可能变化时必须重新查找。
 
+**账户与权限**
+
+24. **权限检查里"想要什么"是位序号，不是掩码**。`hneofs_access(f, uid, want)`
+    内部拿 `want << 6` 去对属主那三位、拿 `want` 直接去对"其他人"那三位，
+    所以 `want` 必须是 4/2/1。传 `HNEOFS_MODE_OWNER_WRITE`(0x080) 进去，
+    属主检查变成 `mode & 0x2000`（永远不成立），"其他人"检查变成
+    `mode & 0x080`（只要属主可写就通过）—— 等于整个权限系统失效，
+    而且失效得很安静：读还能读，写也"能"写，直到你去改一个别人的文件。
+    现在掩码（`HNEOFS_MODE_*`）和需求码（`HNEOFS_ACCESS_*`）是两套名字。
+
+25. **相对路径的父目录是 `cwd`，不是根目录**。创建/删除要先拆出
+    "父目录 + 最后一段"（`split_parent`）。没带斜杠的路径如果当成"在根目录下"，
+    `mkdir mydir` 就变成往 `/` 里写，非 root 用户一律被拒 —— 而 root 测试
+    时一切正常，很容易漏掉。
+
+26. **改了内核内置命令可能一点效果都没有**。Shell 是磁盘优先的：`ls` 敲下去
+    先跑 `/bin/ls.lxe`，内置的 `cmd_ls` 只在磁盘上没有这个程序时才执行。
+    要验证内置命令的改动，得先 `rm /bin/ls.lxe` 把抢跑的程序去掉，
+    或者给内置命令换个名字。
+    顺带一提，ring 3 的程序想知道自己在哪个目录，只能通过 `getcwd()` 问内核
+    （提示符是内核拼的）。
+
+27. **两份系统调用号必须同步**：`include/syscall.h` 与
+    `user/lib/include/hneoc.h` 各定义一份调用号，只改一边的话用户程序会
+    调到别的调用上去（而且返回值看着像普通错误）。
+
 ---
 
 ## 下一步可以做什么
 
 - [ ] 阻塞式 `wait()`，让父进程真正睡眠而不是忙等
 - [ ] 每个进程独立的用户区大小（现在固定 4MB）
-- [ ] 文件写入与删除（现在文件系统只读）
+- [ ] 用户组与更细的权限（现在只有属主 / 其他人两组）
+- [ ] `su` / 修改自己的口令 / 把口令哈希换成带盐的（现在 djb2 无盐）
+- [ ] 每个用户一个私有 home，去掉 `/home` 的 0777
 - [ ] 管道与重定向
 - [ ] 信号机制
 - [ ] 更完整的 libc（现在是只有头文件的极简运行时）

@@ -58,6 +58,10 @@ void process_init(void) {
     strncpy(shell->name, "shell", PROCESS_NAME_MAX - 1);
     shell->start_tick       = 0;
 
+    /* 登录之前先当 root、待在根目录；shell_run 会做真正的登录并改写这两个。 */
+    shell->uid = 0;
+    strncpy(shell->cwd, "/", PROCESS_CWD_MAX - 1);
+
     current       = shell;
     next_pid      = 1;
     total_created = 1;
@@ -69,6 +73,34 @@ void process_init(void) {
 
 process_t* process_current(void) {
     return current;
+}
+
+/* 当前进程的 uid。没有当前进程（比如挂载文件系统时）就当 root。 */
+uint32_t process_uid(void) {
+    return current ? current->uid : 0;
+}
+
+/* 当前进程的工作目录。没有当前进程时给 "/"，让调用方不用判空。 */
+const char* process_cwd(void) {
+    if (current && current->cwd[0] != '\0') {
+        return current->cwd;
+    }
+    return "/";
+}
+
+bool process_is_admin(void) {
+    if (!current) {
+        return true;      /* 还没有进程上下文（启动早期）就当 root */
+    }
+    return current->uid == 0 || current->admin;
+}
+
+void process_set_cwd(const char* path) {
+    if (!current || !path || path[0] == '\0') {
+        return;
+    }
+    strncpy(current->cwd, path, PROCESS_CWD_MAX - 1);
+    current->cwd[PROCESS_CWD_MAX - 1] = '\0';
 }
 
 process_t* process_get(uint32_t index) {
@@ -240,6 +272,16 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
     p->is_user = true;
     p->start_tick = timer_get_ticks();
     total_created++;
+
+    /* 身份和工作目录从创建者那里继承：Shell 是 root 时子程序也是 root，
+     * 普通用户跑的程序同理 —— 系统调用里的权限检查就靠这个 uid。 */
+    p->uid = current ? current->uid : 0;
+    p->admin = current ? current->admin : false;
+    if (current && current->cwd[0] != '\0') {
+        strncpy(p->cwd, current->cwd, PROCESS_CWD_MAX - 1);
+    } else {
+        strncpy(p->cwd, "/", PROCESS_CWD_MAX - 1);
+    }
 
     /* 程序名优先用 LXE 头部里的，没有就退回文件名 */
     {

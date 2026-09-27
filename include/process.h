@@ -28,6 +28,7 @@
 #define PROCESS_NAME_FIELD         16
 #define PROCESS_MAX_FDS            16
 #define PROCESS_ARGS_MAX           128
+#define PROCESS_CWD_MAX            128   /* 工作目录路径长度上限 */
 
 /* 文件描述符 0/1/2 固定映射到控制台，file_index 用这个哨兵值表示 */
 #define FD_CONSOLE 0xFFFFFFFFu
@@ -85,7 +86,13 @@ typedef struct {
      */
     char args[PROCESS_ARGS_MAX];
 
-    /* --- 统计，taskmgr 会展示 --- */
+    /* --- 身份与工作目录 ---
+     * uid 来自登录（0 = root），文件权限检查用它。
+     * cwd 是当前工作目录，相对路径以它为基准。两者都由子进程从创建者继承。
+     */
+    uint32_t  uid;
+    bool      admin;             /* 管理员：文件权限检查里按"属主"看待 */
+    char      cwd[PROCESS_CWD_MAX];
     int32_t   exit_code;
     uint32_t  image_size;
     uint32_t  memory_used;       /* 映像 + 用户栈，退出后仍保留供 taskmgr 显示 */
@@ -94,6 +101,18 @@ typedef struct {
     uint32_t  cpu_ticks;         /* 被调度到的时钟滴答数 */
     uint32_t  syscall_count;
 } process_t;
+
+/* 当前进程的 uid（0 = root）与工作目录。
+ * 没有当前进程时分别返回 0 和 "/"，这样文件系统那边可以无脑调用。 */
+uint32_t    process_uid(void);
+const char* process_cwd(void);
+
+/* 当前进程是不是管理员（uid 0 也算） */
+bool        process_is_admin(void);
+
+/* 直接改写当前进程的工作目录。
+ * 路径的合法性由调用者负责（Shell 的 cd 会先解析成目录再调它）。 */
+void process_set_cwd(const char* path);
 
 /* 初始化进程表，把当前上下文登记成进程 0（Shell） */
 void process_init(void);

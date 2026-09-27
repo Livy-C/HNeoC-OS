@@ -3,8 +3,9 @@
  * 这个程序不是内核里的内置命令，而是磁盘上 /bin/ls.lxe 里的一个
  * ring 3 程序。目录名从命令行参数拿（内核通过 getargs 交给它）。
  *
- *   ls            列根目录
+ *   ls            列当前工作目录
  *   ls /bin       列 /bin
+ *   ls ..         列上一层
  */
 
 #include <hneoc.h>
@@ -31,8 +32,16 @@ int main(void) {
         path[n] = '\0';
 
         if (n == 0) {
-            path[0] = '/';
-            path[1] = '\0';
+            /* 没给目录：列当前工作目录。
+             * 根目录没有目录项，"." 解析不出来，所以根目录得用 "/" 走
+             * sys_listdir 里的特殊分支。 */
+            if (!getcwd(path, sizeof(path))) {
+                path[0] = '/';
+                path[1] = '\0';
+            } else if (path[0] == '\0') {
+                path[0] = '/';
+                path[1] = '\0';
+            }
         }
     }
 

@@ -2,6 +2,7 @@
 #include "../include/ata.h"
 #include "../include/string.h"
 #include "../include/kernel.h"
+#include "../include/process.h"
 
 static hneofs_super_t  superblock;
 static bool            mounted = false;
@@ -216,15 +217,41 @@ uint32_t hneofs_child_count(uint32_t dir_index) {
 /* ------------------------------------------------------------
  * 路径解析
  *
- * 从根目录开始，一段一段往下比对名字。允许前导 '/'，也允许末尾的 '/'。
- * 相对路径同样从根开始（内核 Shell 没有工作目录的概念）。
+ * 绝对路径从根目录开始，一段一段往下比对名字。
+ * 相对路径先拼上当前进程的工作目录（见 process_cwd），所以 `cd` 之后
+ * `cat readme.txt` 这种写法才有意义。
+ * "." 表示当前目录，".." 表示上一级，两者都在这里处理掉。
  * ------------------------------------------------------------ */
 int32_t hneofs_resolve(const char* path) {
     uint32_t parent = HNEOFS_ROOT;
+    char joined[HNEOFS_PATH_MAX];
     const char* p = path;
 
-    if (!mounted || !path) {
+    if (!mounted || !path || path[0] == '\0') {
         return -1;
+    }
+
+    /* 相对路径：拼上工作目录 */
+    if (path[0] != '/') {
+        const char* cwd = process_cwd();
+        int n = 0;
+
+        if (cwd && cwd[0]) {
+            while (cwd[n] && n < HNEOFS_PATH_MAX - 2) {
+                joined[n] = cwd[n];
+                n++;
+            }
+        } else {
+            joined[n++] = '/';
+        }
+        if (n > 0 && joined[n - 1] != '/' && n < HNEOFS_PATH_MAX - 2) {
+            joined[n++] = '/';
+        }
+        for (const char* q = path; *q && n < HNEOFS_PATH_MAX - 1; q++) {
+            joined[n++] = *q;
+        }
+        joined[n] = '\0';
+        p = joined;
     }
 
     while (*p == '/') {
@@ -255,6 +282,25 @@ int32_t hneofs_resolve(const char* path) {
             return -1;   /* 出现了空分量，比如 "a//b" */
         }
 
+        /* "."：停在原地 */
+        if (n == 1 && comp[0] == '.') {
+            if (*p == '\0') {
+                return (parent == HNEOFS_ROOT) ? -1 : (int32_t)parent;
+            }
+            continue;
+        }
+
+        /* ".."：往上一层；已经在根上就停在根 */
+        if (n == 2 && comp[0] == '.' && comp[1] == '.') {
+            if (parent != HNEOFS_ROOT) {
+                parent = file_table[parent].parent;
+            }
+            if (*p == '\0') {
+                return (parent == HNEOFS_ROOT) ? -1 : (int32_t)parent;
+            }
+            continue;
+        }
+
         idx = hneofs_find_child(parent, comp);
         if (idx < 0) {
             return -1;
@@ -270,6 +316,110 @@ int32_t hneofs_resolve(const char* path) {
         }
         parent = (uint32_t)idx;
     }
+}
+
+/* 把一个目录下标还原成绝对路径（Shell 的提示符和 cd 要用）。
+ * 沿 parent 链往上收集名字，再倒着拼出来。 */
+bool hneofs_path_of(uint32_t index, char* out, uint32_t max) {
+    const char* parts[32];
+    uint32_t total = 1;      /* 开头的 '/' 和一个结尾的 0 */
+    int      n = 0;
+    uint32_t cur = index;
+
+    if (!mounted || !out || max < 2) {
+        return false;
+    }
+
+    while (cur != HNEOFS_ROOT) {
+        const hneofs_file_t* f;
+
+        if (n >= 32) {
+            return false;    /* 目录太深了 */
+        }
+        f = hneofs_file(cur);
+        if (!f) {
+            return false;
+        }
+        parts[n++] = f->name;
+        total += (uint32_t)strlen(f->name) + 1;
+        cur = f->parent;
+    }
+
+    if (total > max) {
+        return false;
+    }
+
+    out[0] = '/';
+    {
+        uint32_t pos = 1;
+
+        for (int i = n - 1; i >= 0; i--) {
+            const char* q = parts[i];
+
+            while (*q) {
+                out[pos++] = *q++;
+            }
+            if (i > 0) {
+                out[pos++] = '/';
+            }
+        }
+        out[pos] = '\0';
+    }
+    return true;
+}
+
+/* 权限检查。uid 0（root）一律放行；属主看高三位，其他人看低三位。
+ *
+ * want 用 HNEOFS_ACCESS_*（位序号 4/2/1），不是 HNEOFS_MODE_*（掩码）。
+ * 传掩码进来会让属主检查变成 mode & 0x2000（永远不成立）、
+ * 而"其他人"检查变成 mode & 0x080（只要属主可写就通过），等于没有权限。
+ */
+bool hneofs_access(const hneofs_file_t* f, uint32_t uid, uint32_t want) {
+    uint32_t mode;
+
+    if (!f) {
+        return false;
+    }
+    if (uid == 0) {
+        return true;
+    }
+
+    /* 老镜像没有写 mode（全是 0），按默认权限宽松处理，免得整个系统不可用 */
+    mode = f->mode;
+    if (mode == 0) {
+        mode = (f->type == HNEOFS_TYPE_DIR) ? HNEOFS_MODE_DEFAULT_DIR
+                                            : HNEOFS_MODE_DEFAULT_FILE;
+    }
+
+    if (f->uid == uid) {
+        return (mode & (want << 6)) == (want << 6);
+    }
+    return (mode & want) == want;
+}
+
+/* 当前进程对 f 有没有 want 权限。
+ *
+ * 检查放在文件系统这一层而不是只放在系统调用里：Shell 的内置命令是
+ * 直接调 hneofs_* 的，如果只在系统调用里查，内置命令就成了后门。
+ */
+static bool fs_can(const hneofs_file_t* f, uint32_t want) {
+    process_t* p = process_current();
+
+    if (process_is_admin()) {
+        return true;                 /* root 和管理员都放行 */
+    }
+    return hneofs_access(f, p ? p->uid : 0, want);
+}
+
+/* 能不能往某个目录里写（创建、删除、建子目录都要先过这里）。
+ * 根目录没有自己的目录项，所以只有 root / 管理员能往根里写 ——
+ * 这就是 Unix 里 "/" 属于 root 的意思。
+ */
+static bool parent_writable(uint32_t parent) {
+    if (parent == HNEOFS_ROOT) {
+        return process_is_admin();
+    }
+    return fs_can(hneofs_file(parent), HNEOFS_ACCESS_WRITE);
 }
 
 const hneofs_file_t* hneofs_lookup(const char* path) {
@@ -299,8 +449,12 @@ static int32_t split_parent(const char* path, uint32_t* parent, char* name) {
     }
 
     if (!last) {
-        /* 没有斜杠：直接建在根目录下 */
-        *parent = HNEOFS_ROOT;
+        /* 没有斜杠：建在当前工作目录下。
+         * 不能直接当成根目录 —— 那样 `mkdir mydir`（相对路径）会变成
+         * 往根里写，非 root 用户一律被拒。 */
+        int32_t cwd = hneofs_resolve(".");
+
+        *parent = (cwd < 0) ? HNEOFS_ROOT : (uint32_t)cwd;
         if (!hneofs_name_ok(path)) {
             return HNEOFS_ERR_NAME;
         }
@@ -560,6 +714,9 @@ static int32_t create_entry(uint32_t parent, const char* name, uint32_t type) {
     if (hneofs_find_child(parent, name) >= 0) {
         return HNEOFS_ERR_EXIST;
     }
+    if (!parent_writable(parent)) {
+        return HNEOFS_ERR_PERM;      /* 父目录不可写就别建 */
+    }
 
     slot = find_free_slot();
     if (slot < 0) {
@@ -581,6 +738,11 @@ static int32_t create_entry(uint32_t parent, const char* name, uint32_t type) {
     f->size      = 0;
     f->type      = type;
     f->parent    = parent;
+
+    /* 属主是创建它的那个用户，权限取默认值 */
+    f->uid  = process_uid();
+    f->mode = (type == HNEOFS_TYPE_DIR) ? HNEOFS_MODE_DEFAULT_DIR
+                                        : HNEOFS_MODE_DEFAULT_FILE;
 
     if ((uint32_t)slot >= superblock.file_count) {
         superblock.file_count = (uint32_t)slot + 1;   /* 抬高水位 */
@@ -623,6 +785,11 @@ bool hneofs_unlink(const char* path) {
     }
 
     f = &file_table[idx];
+
+    /* 删除要能写它所在的目录 */
+    if (!parent_writable(f->parent)) {
+        return false;
+    }
 
     /* 目录必须空着才能删 */
     if (f->type == HNEOFS_TYPE_DIR && hneofs_child_count((uint32_t)idx) > 0) {
@@ -696,6 +863,11 @@ int32_t hneofs_write_at(uint32_t index, uint32_t offset,
     }
 
     f = &file_table[index];
+
+    /* 写权限：属主或管理员才能写这个文件 */
+    if (!fs_can(f, HNEOFS_ACCESS_WRITE)) {
+        return HNEOFS_ERR_PERM;
+    }
 
     /* offset + size 回绕的话，下面算出来的 need_sectors 会比实际需要的小，
      * ensure_capacity 就不会扩容，而写入仍然落在 offset 对应的 LBA 上 ——

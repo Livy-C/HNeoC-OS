@@ -96,4 +96,7 @@ panic，并把入口名、当时 esp、返回地址打出来。
 | 被杀掉的进程报"加载失败" | `kernel/process.c` `process_run` | 把"加载失败"和"退出码 -1"都当负返回值返回，Shell 分不清，会打印 `cannot run /bin/xxx.lxe` |
 | guru 之后构建失败 | `build.ps1` | 用 `list runningvms` 判断虚拟机在不在跑，而 `gurumeditation` 状态的 VM 不在这个列表里，于是它没关机就去删 VDI，报 `IOException` |
 | `vga-dump.ps1` 读不出屏幕 | `tools/vga-dump.ps1` | vmcore 里 0xB8000 不是文本单元格式，读出来是乱码 |
-| 文档过期 | `README.md` | 魔数写成 `'LVSF'`（实际 `'HNFS'`，而且 `fsstat` 也跟着打错）、文件表 4 扇区/32 项（实际 8 扇区/64 项）、数据区 LBA 2053（实际 2057）、系统调用表 21 个（实际 24）、陷阱 #23 说反了 |
+| 文档过期 | `README.md` | 魔数写成 `'LVSF'`（实际 `'HNFS'`，而且 `fsstat` 也跟着打错）、文件表 4 扇区/32 项（实际 8 扇区/64 项）、数据区 LBA 2053（实际 2057）、系统调用表只列到 21 个（实际 25）、陷阱 #23 说反了 |
+| `hneoc.h` 里有坏字符 | `user/lib/include/hneoc.h` | 早先一次编辑把 24 个多字节汉字截断成了 U+FFFD（`\uFFFD`），只在注释里，不影响编译 |
+| 口令哈希不是安全 | `kernel/user.c` | djb2 无盐、算法公开，能写 `/etc/passwd` 就能加账户；只做到"明文不落盘" |
+| `/home` 是 0777 | `tools/mkfs.ps1` | 没有用户组、也没有"每个用户一个私有目录"的机制，只好让所有用户都能在 `/home` 下建目录 |

@@ -62,6 +62,20 @@ int getargs(char* buf, size_t max) {
     return (int)__syscall2(SYS_GETARGS, (int32_t)buf, (int32_t)max);
 }
 
+char* getcwd(char* buf, size_t max) {
+    int r;
+
+    if (!buf || max == 0) {
+        return NULL;
+    }
+    r = (int)__syscall2(SYS_GETCWD, (int32_t)buf, (int32_t)max);
+    if (r < 0) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    return buf;
+}
+
 /* ---- 时间与进程 ---- */
 
 unsigned int uptime(void) {

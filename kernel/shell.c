@@ -21,6 +21,7 @@
 #include "../include/process.h"
 #include "../include/syscall.h"
 #include "../include/mouse.h"
+#include "../include/user.h"
 
 /* 键盘驱动送来的特殊按键编码在 keyboard.h 里统一定义 */
 
@@ -124,14 +125,32 @@ static void print_size32(uint32_t bytes) {
  * 命令行渲染
  * ------------------------------------------------------------ */
 
-/* 提示符 "hneoc> "，固定 8 个字符宽 */
-#define PROMPT_WIDTH 8
+/* 提示符 "hneoc$用户~工作目录 "。
+ *
+ * 长度随用户名和路径变化，所以打印时把实际宽度记下来 —— redraw_line
+ * 要靠它把旧提示符盖掉（以前那个固定 8 字符宽度的写法在这里就不成立了）。
+ * '$' 和 '~' 是字面量，只有用户名和工作目录会被替换。
+ */
+static int prompt_width = 8;
 
 static void shell_prompt(void) {
+    const char* who = user_name();
+    const char* dir = process_cwd();
+
     vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     vga_write("hneoc");
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    vga_write("$");
+    vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+    vga_write(who);
+    vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    vga_write("~");
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    vga_write("> ");
+    vga_write(dir);
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    vga_write(" ");
+
+    prompt_width = 5 + 1 + (int)strlen(who) + 1 + (int)strlen(dir) + 1;
 }
 
 /* 把当前 line_buffer 重画到屏幕上（翻历史时用） */
@@ -139,7 +158,7 @@ static void redraw_line(void) {
     vga_putchar('\r');                       /* 回到行首 */
 
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    for (int i = 0; i < PROMPT_WIDTH; i++) {
+    for (int i = 0; i < prompt_width; i++) {
         vga_putchar(' ');                    /* 用空格盖掉旧内容 */
     }
     vga_putchar('\r');
@@ -279,8 +298,16 @@ static void cmd_help(void) {
     vga_writeln("  diskinfo            ATA devices and a PIO read test");
     vga_writeln("  mouse               PS/2 mouse and scrollback status");
     vga_writeln("  screendump [colors] dump the screen as text (debug aid)");
-    vga_writeln("  ls                  list files on the HNeoFS volume");
+    vga_writeln("  ls [dir]            list a directory (with mode and owner)");
     vga_writeln("  cat <file>          print a file");
+    vga_writeln("  cd [dir]            change directory (no arg = your home)");
+    vga_writeln("  pwd                 print the working directory");
+    vga_writeln("  mkdir <dir>         create a directory");
+    vga_writeln("  rm <file>           remove a file or an empty directory");
+    vga_writeln("  whoami              current user, uid and role");
+    vga_writeln("  users               list the accounts in /etc/passwd");
+    vga_writeln("  useradd <n> [admin] create an account (admin only)");
+    vga_writeln("  login               log in again as someone else");
     vga_writeln("  fsstat              filesystem superblock and usage");
     vga_writeln("  exec <program>      load and run a program from disk (ring 3)");
     vga_writeln("  spawn <program>     run it in the background");
@@ -802,17 +829,66 @@ static void cmd_diskinfo(void) {
 /* ------------------------------------------------------------
  * ls [路径]：列出某个目录，不给路径就列根目录
  * ------------------------------------------------------------ */
+/* 权限位画成 -rwxr-xr-x 这种样子。中间三位（用户组）这里不用，统一画成 '-'。 */
+static void print_mode(uint32_t mode, uint32_t type) {
+    char s[11];
+
+    s[0]  = (type == HNEOFS_TYPE_DIR) ? 'd' : '-';
+    s[1]  = (mode & HNEOFS_MODE_OWNER_READ)  ? 'r' : '-';
+    s[2]  = (mode & HNEOFS_MODE_OWNER_WRITE) ? 'w' : '-';
+    s[3]  = (mode & HNEOFS_MODE_OWNER_EXEC)  ? 'x' : '-';
+    s[4]  = '-';
+    s[5]  = '-';
+    s[6]  = '-';
+    s[7]  = (mode & HNEOFS_MODE_OTHER_READ)  ? 'r' : '-';
+    s[8]  = (mode & HNEOFS_MODE_OTHER_WRITE) ? 'w' : '-';
+    s[9]  = (mode & HNEOFS_MODE_OTHER_EXEC)  ? 'x' : '-';
+    s[10] = '\0';
+
+    vga_write(s);
+}
+
+/* 右对齐打印一个无符号数（凑列宽用） */
+static void print_uint_right(uint32_t v, int width) {
+    char tmp[12];
+    int n = 0;
+    int i;
+
+    if (v == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (v > 0 && n < 11) {
+            tmp[n++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+    }
+    for (i = n; i < width; i++) {
+        vga_putchar(' ');
+    }
+    while (n > 0) {
+        vga_putchar(tmp[--n]);
+    }
+}
+
 static void cmd_ls(const char* args) {
     char path[HNEOFS_PATH_MAX];
     char buf[24];
     uint32_t dir = HNEOFS_ROOT;
     uint32_t n = 0;
+    const char* shown;
 
     get_arg(args, 0, path, sizeof(path));
 
+    /* 不带参数就列当前工作目录 —— 根目录没有目录项（hneofs_resolve(".") 返回 -1），
+     * 正好落回 HNEOFS_ROOT */
+    shown = path[0] ? path : process_cwd();
+    if (!shown || shown[0] == '\0') {
+        shown = "/";
+    }
+
     vga_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
     vga_write("HNeoFS  ");
-    vga_writeln(path[0] ? path : "/");
+    vga_writeln(shown);
     vga_set_color(VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
     vga_writeln("--------------------------------------------------------");
 
@@ -823,7 +899,7 @@ static void cmd_ls(const char* args) {
         return;
     }
 
-    /* 给了路径就把它解析成目录下标 */
+    /* 给了路径就把它解析成目录下标；没给就用工作目录 */
     if (path[0]) {
         int32_t idx = hneofs_resolve(path);
 
@@ -842,6 +918,10 @@ static void cmd_ls(const char* args) {
             return;
         }
         dir = (uint32_t)idx;
+    } else {
+        int32_t idx = hneofs_resolve(".");   /* 根目录返回 -1，就是 HNEOFS_ROOT */
+
+        dir = (idx < 0) ? HNEOFS_ROOT : (uint32_t)idx;
     }
 
     if (hneofs_child_count(dir) == 0) {
@@ -852,7 +932,7 @@ static void cmd_ls(const char* args) {
     }
 
     vga_set_color(VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
-    vga_writeln("  name                 size      kind");
+    vga_writeln("  mode       uid  name                size      kind");
 
     for (;;) {
         int32_t idx = hneofs_child_at(dir, n);
@@ -866,6 +946,14 @@ static void cmd_ls(const char* args) {
             break;
         }
         n++;
+
+        /* 权限位和属主 */
+        vga_set_color(VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
+        vga_write("  ");
+        print_mode(f->mode, f->type);
+        vga_putchar(' ');
+        print_uint_right(f->uid, 4);
+        vga_write("  ");
 
         /* 可执行文件用亮绿色，目录用亮青色 */
         if (f->type == HNEOFS_TYPE_DIR) {
@@ -901,6 +989,219 @@ static void cmd_ls(const char* args) {
 /* ------------------------------------------------------------
  * cat <name>：把文件内容打印出来
  * ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+ * cd / pwd 与用户相关命令
+ * ------------------------------------------------------------ */
+
+static void cmd_pwd(const char* args) {
+    (void)args;
+    vga_writeln(process_cwd());
+}
+
+/* 把 base（绝对路径）和 arg 拼起来，并在字符串层面处理掉 "." 和 ".."。
+ *
+ * 为什么不直接丢给 hneofs_resolve：根目录没有自己的目录项，解析 "/.."、
+ * 或者从一级目录退到根，都只会返回 -1 —— 没法用它表示"根"本身。cd 必须
+ * 能回到根，所以先做字符串规范化，再拿结果去 resolve 确认它真的存在。
+ */
+static void path_join_normalize(const char* base, const char* arg,
+                                char* out, int max) {
+    char raw[HNEOFS_PATH_MAX * 2];
+    const char* parts[32];
+    int pn = 0;
+    int n = 0;
+    int i;
+    const char* p;
+
+    if (arg[0] == '/') {
+        for (i = 0; arg[i] && n < (int)sizeof(raw) - 1; i++) { raw[n++] = arg[i]; }
+    } else {
+        for (i = 0; base[i] && n < (int)sizeof(raw) - 2; i++) { raw[n++] = base[i]; }
+        if (n == 0 || raw[n - 1] != '/') { raw[n++] = '/'; }
+        for (i = 0; arg[i] && n < (int)sizeof(raw) - 1; i++) { raw[n++] = arg[i]; }
+    }
+    raw[n] = '\0';
+
+    p = raw;
+    while (*p) {
+        const char* start;
+        int len;
+
+        while (*p == '/') { p++; }
+        if (*p == '\0') { break; }
+
+        start = p;
+        while (*p && *p != '/') { p++; }
+        len = (int)(p - start);
+
+        if (len == 1 && start[0] == '.') {
+            continue;                          /* "." 不改变层级 */
+        }
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (pn > 0) { pn--; }              /* ".." 退一级；在根上就停在根 */
+            continue;
+        }
+        if (pn < 32) { parts[pn++] = start; }
+    }
+
+    out[0] = '/';
+    n = 1;
+    for (i = 0; i < pn; i++) {
+        int len = 0;
+        int k;
+
+        while (parts[i][len] && parts[i][len] != '/') { len++; }
+        if (n > 1 && n < max - 1) { out[n++] = '/'; }
+        for (k = 0; k < len && n < max - 1; k++) {
+            out[n++] = parts[i][k];
+        }
+    }
+    out[n] = '\0';
+}
+
+static void cmd_cd(const char* args) {
+    char path[HNEOFS_PATH_MAX];
+    char abs[HNEOFS_PATH_MAX];
+    int32_t idx;
+
+    get_arg(args, 0, path, sizeof(path));
+
+    if (path[0] == '\0') {
+        /* 不带参数：回自己的 home */
+        char home[USER_HOME_MAX];
+
+        if (user_home_of(user_name(), home, sizeof(home)) && home[0] != '\0') {
+            strncpy(path, home, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        } else {
+            strncpy(path, "/", sizeof(path) - 1);
+        }
+    }
+
+    /* 先规范化：把 "." ".." 和相对路径都算成一条绝对路径 */
+    path_join_normalize(process_cwd(), path, abs, sizeof(abs));
+
+    if (strcmp(abs, "/") == 0) {
+        process_set_cwd("/");     /* 根目录没有目录项，直接认它 */
+        return;
+    }
+
+    idx = hneofs_resolve(abs);
+    if (idx < 0) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_write("cd: no such directory: ");
+        vga_writeln(path);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return;
+    }
+    if (hneofs_file((uint32_t)idx)->type != HNEOFS_TYPE_DIR) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_write("cd: not a directory: ");
+        vga_writeln(path);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return;
+    }
+    process_set_cwd(abs);
+}
+
+static void cmd_mkdir(const char* args) {
+    char path[HNEOFS_PATH_MAX];
+    int32_t rc;
+
+    get_arg(args, 0, path, sizeof(path));
+    if (path[0] == '\0') {
+        vga_writeln("usage: mkdir <directory>");
+        return;
+    }
+
+    rc = hneofs_mkdir(path);      /* 权限在文件系统那一层查，绕不过去 */
+    if (rc >= 0) {
+        return;
+    }
+
+    vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+    vga_write("mkdir: ");
+    vga_writeln(rc == HNEOFS_ERR_PERM  ? "permission denied" :
+                rc == HNEOFS_ERR_EXIST ? "already exists" :
+                rc == HNEOFS_ERR_NOENT ? "no such parent directory" :
+                rc == HNEOFS_ERR_FULL  ? "the file table is full" :
+                rc == HNEOFS_ERR_NOSPC ? "no space left" : "failed");
+    vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+}
+
+static void cmd_rm(const char* args) {
+    char path[HNEOFS_PATH_MAX];
+    int32_t idx;
+
+    get_arg(args, 0, path, sizeof(path));
+    if (path[0] == '\0') {
+        vga_writeln("usage: rm <file>");
+        return;
+    }
+
+    idx = hneofs_resolve(path);
+    if (idx < 0) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_write("rm: no such file: ");
+        vga_writeln(path);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return;
+    }
+    if (hneofs_file((uint32_t)idx)->type == HNEOFS_TYPE_DIR &&
+        hneofs_child_count((uint32_t)idx) > 0) {
+        vga_writeln("rm: directory not empty");
+        return;
+    }
+
+    if (!hneofs_unlink(path)) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_write("rm: cannot remove ");
+        vga_writeln(path);
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    }
+}
+
+static void cmd_whoami(const char* args) {
+    (void)args;
+    vga_write(user_name());
+    vga_write("   uid ");
+    vga_write_uint(process_uid());
+    vga_writeln(user_is_admin() ? "   (admin)" : "");
+}
+
+static void cmd_users(const char* args) {
+    (void)args;
+    user_list();
+}
+
+static void cmd_useradd(const char* args) {
+    char name[USER_NAME_MAX];
+    char flag[8];
+
+    get_arg(args, 0, name, sizeof(name));
+    get_arg(args, 1, flag, sizeof(flag));
+
+    if (name[0] == '\0') {
+        vga_writeln("usage: useradd <name> [admin]");
+        return;
+    }
+    if (!user_is_admin()) {
+        vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+        vga_writeln("useradd: only an administrator can add accounts");
+        vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        return;
+    }
+    user_add_interactive(name, strcmp(flag, "admin") == 0);
+}
+
+static void cmd_login(const char* args) {
+    (void)args;
+    while (!user_login()) {
+        /* 三次失败或者被 Ctrl+C 打断就重新来一遍，不放行 */
+    }
+    vga_writeln("");
+}
+
 static void cmd_cat(const char* args) {
     char name[HNEOFS_PATH_MAX];
     const hneofs_file_t* f;
@@ -1688,6 +1989,17 @@ static void shell_execute(char* line) {
         }
 
         if (hneofs_mounted() && hneofs_lookup(program)) {
+            const hneofs_file_t* pf = hneofs_lookup(program);
+
+            /* 没有执行位就不能跑（root 例外，见 hneofs_access） */
+            if (pf && !hneofs_access(pf, process_uid(), HNEOFS_ACCESS_EXEC)) {
+                vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
+                vga_write("permission denied: ");
+                vga_writeln(program);
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                return;
+            }
+
             int rc = process_run(program, args);
 
             if (rc < 0) {
@@ -1700,7 +2012,23 @@ static void shell_execute(char* line) {
         }
     }
 
-    if (strcmp(cmd, "help") == 0) {
+    if (strcmp(cmd, "cd") == 0) {
+        cmd_cd(args);
+    } else if (strcmp(cmd, "pwd") == 0) {
+        cmd_pwd(args);
+    } else if (strcmp(cmd, "mkdir") == 0) {
+        cmd_mkdir(args);
+    } else if (strcmp(cmd, "rm") == 0) {
+        cmd_rm(args);
+    } else if (strcmp(cmd, "whoami") == 0) {
+        cmd_whoami(args);
+    } else if (strcmp(cmd, "users") == 0) {
+        cmd_users(args);
+    } else if (strcmp(cmd, "useradd") == 0) {
+        cmd_useradd(args);
+    } else if (strcmp(cmd, "login") == 0) {
+        cmd_login(args);
+    } else if (strcmp(cmd, "help") == 0) {
         cmd_help();
     } else if (strcmp(cmd, "clear") == 0) {
         vga_clear();
@@ -1791,6 +2119,12 @@ void shell_print_banner(void) {
  * Shell 主循环
  * ------------------------------------------------------------ */
 void shell_run(void) {
+    /* 先登录。拿到 uid 和工作目录之后，提示符和文件权限检查才有意义。 */
+    while (!user_login()) {
+        /* 登录失败就重新问，不放行 —— 除非账户表本身读不到，
+         * 那种情况 user_login 会直接放行，免得整个系统进不去。 */
+    }
+
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     vga_writeln("Type 'help' for the command list.");
     vga_writeln("Up/Down arrows browse the command history.");

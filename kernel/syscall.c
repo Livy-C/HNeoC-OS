@@ -87,6 +87,10 @@ static bool copy_user_string(uint32_t uaddr, char* out, uint32_t max) {
  * 各个系统调用的实现
  * ------------------------------------------------------------ */
 
+/* 权限检查实现在文件系统那一节（因为 sys_write/sys_read 更靠前） */
+static bool access_ok(const hneofs_file_t* f, uint32_t want);
+static bool parent_access_ok(const char* path, uint32_t want);
+
 static int32_t sys_write(int32_t fd, uint32_t buf, uint32_t len) {
     fd_entry_t* e;
     int32_t rc;
@@ -126,6 +130,15 @@ static int32_t sys_write(int32_t fd, uint32_t buf, uint32_t len) {
         return -1;
     }
 
+    /* 权限：要写就得是属主（或 other 写位），root 例外 */
+    {
+        const hneofs_file_t* wf = hneofs_file(e->file_index);
+
+        if (!wf || !access_ok(wf, HNEOFS_ACCESS_WRITE)) {
+            return HNEOFS_ERR_PERM;
+        }
+    }
+
     sched_lock();
     enable_interrupts();
 
@@ -140,6 +153,59 @@ static int32_t sys_write(int32_t fd, uint32_t buf, uint32_t len) {
     e->offset += (uint32_t)rc;
     return rc;
 }
+
+/* ------------------------------------------------------------
+ * 权限
+ *
+ * 所有碰文件系统的系统调用都要过这一关。进程的 uid 由登录写进
+ * process_t，子进程继承，所以"谁在跑这个程序"是明确的。
+ * root（uid 0）一律放行。
+ * ------------------------------------------------------------ */
+
+static bool access_ok(const hneofs_file_t* f, uint32_t want) {
+    return hneofs_access(f, process_uid(), want);
+}
+
+/* 在 path 的父目录上做权限检查 —— 创建/删除/建目录都要先过这里。
+ *
+ * 根目录没有自己的目录项，所以"往根里写"一律要求 root：这和 Unix 里
+ * / 属于 root 是一个意思。
+ */
+static bool parent_access_ok(const char* path, uint32_t want) {
+    char dir[HNEOFS_PATH_MAX];
+    int  n = 0;
+    int  cut = -1;
+    int32_t idx;
+
+    if (!path) {
+        return false;
+    }
+
+    for (int i = 0; path[i] && i < (int)sizeof(dir) - 1; i++) {
+        dir[n++] = path[i];
+        if (path[i] == '/') {
+            cut = n;              /* 记住最后一个 '/' 之后的位置 */
+        }
+    }
+    dir[n] = '\0';
+
+    if (cut < 0) {
+        idx = hneofs_resolve(".");            /* 父目录就是工作目录 */
+    } else {
+        dir[cut] = '\0';                      /* 砍掉最后一段 */
+        if (dir[0] == '\0') {
+            return process_uid() == 0;        /* 形如 "/x"：父目录是根 */
+        }
+        idx = hneofs_resolve(dir);
+    }
+
+    if (idx < 0) {
+        return process_uid() == 0;            /* 解析不出来就按根处理 */
+    }
+    return access_ok(hneofs_file((uint32_t)idx), want);
+}
+
+/* 每个用户对自己 home 下的东西有完全权限；这也是 mkdir 之类能用的前提 */
 
 /* ------------------------------------------------------------
  * 文件描述符相关的系统调用
@@ -167,6 +233,10 @@ static int32_t sys_open(uint32_t name_ptr, uint32_t flags) {
         if ((flags & HNEOFS_O_CREAT) == 0) {
             return HNEOFS_ERR_NOENT;
         }
+        /* 新建文件：父目录必须可写 */
+        if (!parent_access_ok(path, HNEOFS_ACCESS_WRITE)) {
+            return HNEOFS_ERR_PERM;
+        }
         index = hneofs_create(path);      /* 父目录必须已经存在 */
         if (index < 0) {
             return index;
@@ -175,6 +245,24 @@ static int32_t sys_open(uint32_t name_ptr, uint32_t flags) {
         if (hneofs_file((uint32_t)index)->type == HNEOFS_TYPE_DIR) {
             return HNEOFS_ERR_ISDIR;      /* 目录不能当文件打开 */
         }
+
+        /* 打开已有文件：按要做的事检查权限。
+         * 注意这里用的是 HNEOFS_ACCESS_*（要读/写/执行），不是 HNEOFS_O_*（打开标志），
+         * 也不是 HNEOFS_MODE_*（权限掩码） */
+        {
+            uint32_t want = 0;
+
+            if (flags & (HNEOFS_O_WRONLY | HNEOFS_O_RDWR)) {
+                want |= HNEOFS_ACCESS_WRITE;
+            }
+            if ((flags & HNEOFS_O_WRONLY) == 0) {
+                want |= HNEOFS_ACCESS_READ;   /* 只读和读写都要读权限 */
+            }
+            if (want != 0 && !access_ok(hneofs_file((uint32_t)index), want)) {
+                return HNEOFS_ERR_PERM;
+            }
+        }
+
         if (flags & HNEOFS_O_TRUNC) {
             hneofs_truncate((uint32_t)index, 0);
         }
@@ -212,6 +300,9 @@ static int32_t sys_read(int32_t fd, uint32_t buf, uint32_t len) {
     f = hneofs_file(e->file_index);
     if (!f) {
         return -1;
+    }
+    if (!access_ok(f, HNEOFS_ACCESS_READ)) {
+        return HNEOFS_ERR_PERM;
     }
     if (e->offset >= f->size) {
         return 0;   /* 到文件末尾了 */
@@ -278,6 +369,10 @@ static int32_t sys_unlink(uint32_t name_ptr) {
     if (!copy_user_string(name_ptr, path, sizeof(path))) {
         return HNEOFS_ERR_NAME;
     }
+    /* 删除要能写父目录：写不了 /etc 就不能删 /etc/passwd */
+    if (!parent_access_ok(path, HNEOFS_ACCESS_WRITE)) {
+        return HNEOFS_ERR_PERM;
+    }
     return hneofs_unlink(path) ? 0 : HNEOFS_ERR_NOENT;
 }
 
@@ -335,6 +430,11 @@ static int32_t sys_mkdir(uint32_t path_ptr) {
         return HNEOFS_ERR_NAME;
     }
 
+    /* 建目录要求父目录可写 */
+    if (!parent_access_ok(path, HNEOFS_ACCESS_WRITE)) {
+        return HNEOFS_ERR_PERM;
+    }
+
     return hneofs_mkdir(path);
 }
 
@@ -352,6 +452,33 @@ static int32_t sys_getargs(uint32_t buf, uint32_t max) {
 
     while (n + 1 < max && p->args[n]) {
         ((char*)buf)[n] = p->args[n];
+        n++;
+    }
+    ((char*)buf)[n] = '\0';
+    return (int32_t)n;
+}
+
+/* 把当前进程的工作目录拷给用户程序。
+ *
+ * 有了它，用户态的 ls / vi 才能知道自己"站在哪儿"：
+ * 内核 Shell 的提示符是内核拼的，ring 3 的程序只能靠这个系统调用问。
+ */
+static int32_t sys_getcwd(uint32_t buf, uint32_t max) {
+    const char* cwd = process_cwd();
+    uint32_t n = 0;
+
+    if (!buf || max == 0) {
+        return -1;
+    }
+    if (!user_range_ok(buf, max)) {
+        return -1;
+    }
+    if (!cwd || cwd[0] == '\0') {
+        cwd = "/";
+    }
+
+    while (n + 1 < max && cwd[n]) {
+        ((char*)buf)[n] = cwd[n];
         n++;
     }
     ((char*)buf)[n] = '\0';
@@ -420,6 +547,9 @@ static int32_t sys_readfile(uint32_t name_ptr, uint32_t buf, uint32_t max) {
     f = hneofs_lookup(name);
     if (!f || f->type != HNEOFS_TYPE_FILE) {
         return -1;
+    }
+    if (!access_ok(f, HNEOFS_ACCESS_READ)) {
+        return HNEOFS_ERR_PERM;
     }
 
     want = f->size;
@@ -593,6 +723,10 @@ void syscall_handler(registers_t* regs) {
 
         case SYS_GETARGS:
             ret = sys_getargs(regs->ebx, regs->ecx);
+            break;
+
+        case SYS_GETCWD:
+            ret = sys_getcwd(regs->ebx, regs->ecx);
             break;
 
         case SYS_OPEN:
