@@ -376,6 +376,17 @@ static int32_t sys_readfile(uint32_t name_ptr, uint32_t buf, uint32_t max) {
     if (!copy_user_string(name_ptr, name, sizeof(name))) {
         return -1;
     }
+
+    /* max 至少要有 2：下面要留一个字节写结尾的 '\0'。
+     *
+     * 不能只靠 user_range_ok 把关 —— 它在 len == 0 时会直接返回 true，
+     * 而 max == 0 时 want 会被算成 (max - 1) == 0xFFFFFFFF，那个钳位形同虚设，
+     * 内核就会把整份文件写进一个完全没校验过的用户地址（未映射页 → 内核态
+     * 缺页 → 整机 System halted）。
+     */
+    if (max < 2) {
+        return -1;
+    }
     if (!user_range_ok(buf, max)) {
         return -1;
     }

@@ -722,8 +722,30 @@ int process_run(const char* filename, const char* args) {
 
     code = p->exit_code;
 
-    /* 回收槽位。kernel_stack 应该已经被 reap_zombies 释放了 */
-    p->state = PROC_UNUSED;
+    /* 回收槽位。
+     *
+     * 这里不能指望 reap_zombies 已经回收了内核栈：它只在时钟中断里回收
+     * "当前不在跑"的僵尸，而 Shell 早在孩子退出那一刻就被切回来了，
+     * 我们下面马上就把槽位标成 UNUSED，reap_zombies 再也不会看它一眼 ——
+     * 那 8KB 内核栈就永远漏掉了（紧接着 alloc_slot 会把槽位 memset 掉，
+     * 连指针一起丢）。所以在这里自己释放，和 reap_zombies 做的一样。
+     *
+     * 关中断是为了别让时钟中断插在"释放栈"和"标记 UNUSED"之间：
+     * 否则 reap_zombies 可能对同一个指针再释放一次。
+     */
+    {
+        uint32_t flags = irq_save();
+
+        if (p->kernel_stack) {
+            kfree(p->kernel_stack);
+            p->kernel_stack      = NULL;
+            p->kernel_stack_top  = 0;
+            p->kernel_stack_size = 0;
+        }
+        p->state = PROC_UNUSED;
+
+        irq_restore(flags);
+    }
 
     return (int)code;
 }
@@ -761,10 +783,26 @@ int process_kill(uint32_t pid) {
         return -4;   /* 已经退出了 */
     }
 
-    p->exit_code = -1;
-    p->end_tick  = timer_get_ticks();
-    free_user_resources(p);
-    p->state = PROC_ZOMBIE;
+    /* 关中断，并且先标僵尸再释放资源。
+     *
+     * 原来的顺序（先 free_user_resources、后标 ZOMBIE）有个真实的竞态：
+     * 这个函数是 Shell 调的，中断开着。时钟中断只要插在 free_user_resources
+     * 中间，pick_next 就可能挑中这个还是 READY、但页目录已经被回收的任务 ——
+     * 轻则切进没有用户页的地址空间缺页崩机，重则 CR3 指向已经交还给 pmm、
+     * 可能被重新分配出去的页框。
+     * 先标 ZOMBIE，任务立刻就不可能被调度到；内核栈仍然留着，由
+     * reap_zombies 在下一次调度时回收。
+     */
+    {
+        uint32_t flags = irq_save();
+
+        p->exit_code = -1;
+        p->end_tick  = timer_get_ticks();
+        p->state     = PROC_ZOMBIE;
+        free_user_resources(p);
+
+        irq_restore(flags);
+    }
 
     return 0;
 }
