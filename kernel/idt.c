@@ -3,6 +3,7 @@
 #include "../include/vga.h"
 #include "../include/paging.h"
 #include "../include/process.h"
+#include "../include/kernel.h"
 
 /* 256 个中断门 */
 #define IDT_ENTRIES 256
@@ -87,6 +88,8 @@ static void vga_write_hex32(uint32_t value) {
  * 的就是那个任务的寄存器现场 —— 上下文切换就是这么完成的。
  */
 uint32_t isr_handler(registers_t* regs) {
+    stack_guard("isr_handler");
+
     /* 中断号 0-31 属于 CPU 异常。 */
     if (regs->int_no < 32) {
         process_t* p = process_current();

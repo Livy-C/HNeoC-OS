@@ -748,6 +748,7 @@ int process_run(const char* filename, const char* args) {
     /* 等它跑完。cpu_halt 会让出 CPU，时钟中断随时可以切过去执行它。 */
     while (p->state != PROC_ZOMBIE) {
         cpu_halt();
+        stack_guard("process_run");
 
         /* Ctrl+C 打断前台程序。
          * 这是把跑飞的程序拉回来的唯一办法：Shell 此刻正阻塞在这个循环里，

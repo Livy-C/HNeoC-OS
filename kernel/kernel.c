@@ -36,6 +36,54 @@ static void boot_step(const char* name) {
     vga_writeln(name);
 }
 
+/* ------------------------------------------------------------
+ * 内核栈守卫
+ *
+ * 内核 BSS 结束在 bss_end，而 Shell 用的是 0x90000 那块引导栈 —— 两者之间
+ * 只有不到 200KB。一旦某条调用链吃掉的栈超过这个余量，栈就会静默穿过
+ * BSS、内核映像、paging 的 pd_storage，最后压在页目录（0x24000）上：
+ * 页目录一坏，连异常处理都进不去，CPU 直接三重故障，什么都不留下
+ * （我们查那个未解之谜时，VBox 只留下 eip=0x100a4 / esp≈0x23ff4）。
+ *
+ * 所以在几个关键入口处量一下 esp。真掉下去了就 panic，至少能指出是谁。
+ * ------------------------------------------------------------ */
+static char guard_msg[96];
+
+static void guard_hex8(char* out, uint32_t v) {
+    const char* d = "0123456789ABCDEF";
+
+    for (int i = 7; i >= 0; i--) {
+        out[i] = d[v & 0xF];
+        v >>= 4;
+    }
+}
+
+void stack_guard(const char* where) {
+    uint32_t sp;
+    uint32_t ret;
+    int i;
+
+    __asm__ __volatile__("movl %%esp, %0" : "=r"(sp));
+    if (sp >= KERNEL_STACK_FLOOR) {
+        return;
+    }
+
+    ret = (uint32_t)__builtin_return_address(0);
+
+    for (i = 0; i < 60 && where[i]; i++) {
+        guard_msg[i] = where[i];
+    }
+    guard_msg[i++] = ' ';
+    guard_hex8(&guard_msg[i], sp);
+    i += 8;
+    guard_msg[i++] = ' ';
+    guard_hex8(&guard_msg[i], ret);
+    i += 8;
+    guard_msg[i] = '\0';
+
+    kernel_panic(guard_msg);
+}
+
 /* 内核主入口：由 kernel/arch.asm 中的 kernel_entry 调用
  * 此时已经处于 32 位保护模式，BSS 已被清零
  */

@@ -1,6 +1,7 @@
 #include "../include/hneofs.h"
 #include "../include/ata.h"
 #include "../include/string.h"
+#include "../include/kernel.h"
 
 static hneofs_super_t  superblock;
 static bool            mounted = false;
@@ -21,6 +22,8 @@ static inline bool slot_used(uint32_t i) {
  * ------------------------------------------------------------ */
 static bool read_sectors(uint32_t lba, uint32_t count, void* buffer) {
     uint8_t* p = (uint8_t*)buffer;
+
+    stack_guard("read_sectors");
 
     while (count > 0) {
         uint32_t chunk = (count > IO_CHUNK) ? IO_CHUNK : count;
