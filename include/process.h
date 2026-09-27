@@ -106,6 +106,12 @@ uint32_t sched_tick(registers_t* regs);
 /* 主动让出 CPU（下一次时钟中断时切换） */
 void sched_yield(void);
 
+/* 调度器临界区：sched_lock 之后 sched_tick 不再切换任务，但仍然让中断进来，
+ * 所以键盘和时钟保持工作。给"必须开着中断做长时间磁盘 I/O"的代码用。
+ * 必须成对调用，允许嵌套。 */
+void sched_lock(void);
+void sched_unlock(void);
+
 /* 当前正在运行的进程 */
 process_t* process_current(void);
 

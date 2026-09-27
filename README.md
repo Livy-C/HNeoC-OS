@@ -197,6 +197,8 @@ typedef struct {
 | `wtest` | `wtest.lxe` | 可写文件系统自测：创建、写入、定位读、追加、删除 |
 | `systest` | `systest.lxe` | 系统调用边界自测：readfile 的 max、lseek 的偏移量（故意越界） |
 | `fault` | `fault.lxe` | 故意触发用户态缺页，验证内核只杀进程而不停机 |
+| `spin` | `spin.lxe` | 前台死循环，用来验证 Ctrl+C 能把跑飞的程序拉回来 |
+| `bigio` | `bigio.lxe` | 一次写完 2MB，验证长 I/O 期间中断没被关死、写入没被截断 |
 | `note` | `note.lxe` | 往 notes.txt 追加一行，用来验证数据真的落盘 |
 | `termdemo` | `termdemo.lxe` | term.h 终端 API 示例：固定状态栏 + 滚动区域 + 进度条 |
 

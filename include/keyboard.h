@@ -35,4 +35,8 @@ int keyboard_getchar(void);
 /* 当前是否按住了 Shift */
 bool keyboard_shift_pressed(void);
 
+/* 用户是否按过 Ctrl+C（读一次就清掉）。
+ * 前台程序跑飞时，Shell 靠它把程序杀掉。 */
+bool keyboard_take_ctrl_c(void);
+
 #endif /* KEYBOARD_H */

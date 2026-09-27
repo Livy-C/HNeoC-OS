@@ -9,6 +9,7 @@
 #include "../include/string.h"
 #include "../include/ports.h"
 #include "../include/kernel.h"
+#include "../include/keyboard.h"
 
 static process_t  processes[PROCESS_MAX];
 static process_t* current       = NULL;
@@ -20,6 +21,12 @@ static uint32_t   total_created = 0;
 
 static uint32_t slice_left = SCHED_TIME_SLICE;
 static bool     force_switch = false;   /* 主动让出或被退出时置位 */
+
+/* >0 表示有临界区正开着中断做长时间 I/O：中断照常进来（键照收、滴答照数），
+ * 但调度器不许换任务 —— 临界区手里的文件系统全局状态还没交接完。
+ * 关中断也能挡住切换，代价是把键盘和时钟一起冻住；这个计数器专门用来避免那个代价。
+ */
+static volatile uint32_t sched_locked = 0;
 
 /* 定义在后面，process_init 里要用 */
 static void init_fds(process_t* p);
@@ -582,6 +589,10 @@ int32_t process_sbrk(int32_t increment) {
  * 调度器
  * ------------------------------------------------------------ */
 
+/* 见 include/process.h：禁止切换任务，但允许中断进来 */
+void sched_lock(void)   { sched_locked++; }
+void sched_unlock(void) { if (sched_locked > 0) { sched_locked--; } }
+
 /* 选下一个可运行的任务：从当前下标往后找第一个 READY 的。
  * 一定跳过 current —— 否则会"切换到自己"，白白多做一次 CR3 写入。
  */
@@ -614,6 +625,14 @@ uint32_t sched_tick(registers_t* regs) {
             current->state = PROC_READY;
         }
         current->cpu_ticks++;
+    }
+
+    /* 有临界区开着中断时只数滴答、不换任务 */
+    if (sched_locked > 0) {
+        if (current) {
+            current->state = PROC_RUNNING;
+        }
+        return 0;
     }
 
     /* 只有时钟中断才做时间片轮转；主动让出或任务退出时强制切换 */
@@ -723,9 +742,20 @@ int process_run(const char* filename, const char* args) {
         return err;
     }
 
+    /* 丢掉可能在提示符处按下的 Ctrl+C，免得刚启动的程序立刻被杀 */
+    (void)keyboard_take_ctrl_c();
+
     /* 等它跑完。cpu_halt 会让出 CPU，时钟中断随时可以切过去执行它。 */
     while (p->state != PROC_ZOMBIE) {
         cpu_halt();
+
+        /* Ctrl+C 打断前台程序。
+         * 这是把跑飞的程序拉回来的唯一办法：Shell 此刻正阻塞在这个循环里，
+         * 没有别的地方能收命令。杀掉之后循环条件不成立，正常往下走。
+         */
+        if (keyboard_take_ctrl_c()) {
+            process_kill(p->pid);
+        }
     }
 
     code = p->exit_code;

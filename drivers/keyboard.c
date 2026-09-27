@@ -24,6 +24,11 @@ static volatile bool shift_pressed = false;
 static volatile bool caps_lock     = false;
 static volatile bool extended      = false;
 
+/* Ctrl 状态，以及"用户按了 Ctrl+C"这个一次性标志。
+ * 前台程序跑飞时，Shell 就是靠它把程序拉回来的。 */
+static volatile bool ctrl_pressed   = false;
+static volatile bool ctrl_c_pending = false;
+
 /* 普通按键映射表（Scancode Set 1，按下时的通码） */
 static const char keymap_normal[128] = {
     0,    27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -114,9 +119,26 @@ static void keyboard_callback(registers_t* regs) {
         return;
     }
 
+    /* 跟踪 Ctrl（左 Ctrl 是 0x1D；右 Ctrl 带 0xE0 前缀，这里不处理） */
+    if (code == 0x1D) {
+        ctrl_pressed = !released;
+        pic_send_eoi(1);
+        return;
+    }
+
     /* CapsLock 在按下瞬间翻转一次 */
     if (code == 0x3A && !released) {
         caps_lock = !caps_lock;
+        pic_send_eoi(1);
+        return;
+    }
+
+    /* Ctrl+C：置一次性标志，并且**不**把这个字符放进缓冲区 ——
+     * 否则它会被下一个人读走（前台程序收到一个多余的 'c'，
+     * 或者 Shell 的命令行里凭空多出一个 'c'）。
+     */
+    if (ctrl_pressed && !released && code == 0x2E) {
+        ctrl_c_pending = true;
         pic_send_eoi(1);
         return;
     }
@@ -145,6 +167,8 @@ void keyboard_init(void) {
     shift_pressed = false;
     caps_lock     = false;
     extended      = false;
+    ctrl_pressed   = false;
+    ctrl_c_pending = false;
 
     register_interrupt_handler(IRQ1, keyboard_callback);
     pic_clear_mask(1);
@@ -194,4 +218,14 @@ int keyboard_getchar(void) {
 
 bool keyboard_shift_pressed(void) {
     return shift_pressed;
+}
+
+/* 取走"用户按过 Ctrl+C"这个标志（读一次就清掉）。
+ * Shell 在前台程序期间轮询它，用来打断跑飞的程序。 */
+bool keyboard_take_ctrl_c(void) {
+    if (!ctrl_c_pending) {
+        return false;
+    }
+    ctrl_c_pending = false;
+    return true;
 }

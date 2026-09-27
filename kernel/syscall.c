@@ -112,14 +112,28 @@ static int32_t sys_write(int32_t fd, uint32_t buf, uint32_t len) {
     }
 
     /* 普通文件：写进文件系统。
-     * 注意这里全程关着中断（系统调用门是 interrupt gate），
-     * 而 PIO 写盘只需要几毫秒，不会把时钟拖垮。
+     *
+     * 系统调用门是 interrupt gate，进来时 IF=0，原来这里全程关着中断，
+     * 注释说"PIO 写盘只需要几毫秒" —— 那是按写几百字节算的。用户一次可以
+     * 请求到 4MB（user_range_ok 的上限），PIO 搬这么多要几十毫秒到几秒，
+     * 那段时间键盘收不到键、100Hz 时钟也不走，uptime 直接偏掉。
+     *
+     * 现在改成"开着中断但不换任务"：中断照常进来收键、数滴答，sched_lock
+     * 保证调度器不切走 —— 文件系统的全局状态还在我们手里，切走就可能
+     * 被另一个任务改坏。
      */
     if (!e) {
         return -1;
     }
 
+    sched_lock();
+    enable_interrupts();
+
     rc = hneofs_write_at(e->file_index, e->offset, (const void*)buf, len);
+
+    disable_interrupts();
+    sched_unlock();
+
     if (rc < 0) {
         return rc;
     }
@@ -413,7 +427,17 @@ static int32_t sys_readfile(uint32_t name_ptr, uint32_t buf, uint32_t max) {
         want = max - 1;   /* 留一个字节给结尾的 0 */
     }
 
-    int32_t got = hneofs_read_at(f, 0, (void*)buf, want);
+    int32_t got;
+
+    /* 同 sys_write：读一份大文件也可能要几十毫秒，别把中断关死 */
+    sched_lock();
+    enable_interrupts();
+
+    got = hneofs_read_at(f, 0, (void*)buf, want);
+
+    disable_interrupts();
+    sched_unlock();
+
     if (got < 0) {
         return -1;
     }
