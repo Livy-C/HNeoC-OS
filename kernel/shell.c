@@ -1444,6 +1444,11 @@ static void cmd_exec(const char* args) {
         case -3: vga_writeln("out of kernel memory"); break;
         case -4: vga_writeln("disk read failed"); break;
         case -5: vga_writeln("not a valid LXE (bad header or too big)"); break;
+        case -6:
+            vga_writeln("program image is too large to load");
+            vga_set_color(VGA_COLOR_DARK_GREY, VGA_COLOR_BLACK);
+            vga_writeln("   (a loader bug makes big images fatal - KNOWN-ISSUES #1)");
+            break;
         default: vga_writeln("unknown error"); break;
     }
     vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
@@ -2013,7 +2018,20 @@ static void shell_execute(char* line) {
             if (rc < 0) {
                 vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
                 vga_write("cannot run ");
-                vga_writeln(program);
+                vga_write(program);
+                vga_write(": ");
+                /* 这里的理由表必须和 cmd_exec 里那张保持一致，
+                 * 否则 -6（镜像超过 PROCESS_MAX_LOAD_BYTES）这类新错误
+                 * 就只会打一句没头没尾的 "cannot run xxx"。 */
+                switch (rc) {
+                    case -1: vga_writeln("no such file on the volume"); break;
+                    case -2: vga_writeln("filesystem is not mounted"); break;
+                    case -3: vga_writeln("out of kernel memory"); break;
+                    case -4: vga_writeln("disk read failed"); break;
+                    case -5: vga_writeln("not a valid LXE (bad header)"); break;
+                    case -6: vga_writeln("program image is too large to load"); break;
+                    default: vga_writeln("unknown error"); break;
+                }
                 vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
             }
             return;

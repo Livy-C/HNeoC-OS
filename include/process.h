@@ -30,6 +30,15 @@
 #define PROCESS_ARGS_MAX           128
 #define PROCESS_CWD_MAX            128   /* 工作目录路径长度上限 */
 
+/* 能加载的 .lxe 最大字节数。
+ *
+ * 这不是一个设计上的限制，而是给 KNOWN-ISSUES 第 1 节那个缺陷加的护栏：
+ * 镜像超过 60KB 左右时，加载器会在读盘途中把整机打成三重故障。
+ * 明确拒绝（错误码 -6）比让虚拟机崩掉好得多。
+ * 目前镜像最大的是 hncc.lxe（40KB），自带程序都不受影响。
+ */
+#define PROCESS_MAX_LOAD_BYTES     (60 * 1024)
+
 /* 文件描述符 0/1/2 固定映射到控制台，file_index 用这个哨兵值表示 */
 #define FD_CONSOLE 0xFFFFFFFFu
 

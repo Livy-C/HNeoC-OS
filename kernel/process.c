@@ -442,6 +442,22 @@ static process_t* load_program(const char* filename, const char* args, int* err)
         return NULL;
     }
 
+    /* 拒绝过大的 .lxe —— 这是给一个还没查清的缺陷加的护栏。
+     *
+     * 镜像超过 60KB 左右时，加载器会在读盘过程中把整机打成三重故障
+     * （KNOWN-ISSUES.md 第 1 节；那里列了四条**已经实测排除**的解释：
+     * 堆缓冲区本身、任务切换、读盘期间的中断、以及"大读取"这件事本身）。
+     * 与其让虚拟机当场崩掉、现场什么都不剩，不如明确拒绝：用户看到的
+     * 是一句人话加一个错误码，而不是黑屏重启。
+     *
+     * 现在镜像最大的是 hncc.lxe（40KB），所以这个上限不影响任何自带程序；
+     * 等缺陷查清之后把 PROCESS_MAX_LOAD_BYTES 去掉即可。
+     */
+    if (f->size > PROCESS_MAX_LOAD_BYTES) {
+        *err = -6;
+        return NULL;
+    }
+
     image = (uint8_t*)kmalloc(f->size);
     if (!image) {
         *err = -3;

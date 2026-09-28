@@ -37,7 +37,11 @@ param(
     [switch]$List,
     [string]$Only = "",
     [int]$BootWait = 34,
-    [int]$TypeDelayMs = 60,
+    # Typing faster than this makes the guest drop and duplicate scan codes
+    # (and can even produce a spurious mouse-wheel event, which flips the
+    # console into its scrollback view and eats the next key). 60ms looked
+    # fine for a while and then produced "sstes" instead of "systest".
+    [int]$TypeDelayMs = 150,
     [int]$StepTimeout = 30
 )
 
@@ -137,6 +141,15 @@ $checks = @(
     @{ Name = "bigbss 512KB bss"; Send = @("bigbss");
        Expect = @("zero filled at start : yes",
                   "the 512KB array works") },
+
+    # KNOWN-ISSUES #1: an image bigger than the loader's limit used to
+    # triple-fault the VM (a 526KB one is kept in tests\bigdata.c as the
+    # extreme reproducer). The loader now refuses such images instead, and
+    # this check makes sure the refusal stays graceful.
+    # If the bug gets fixed, delete the guard in include/process.h, remove
+    # user/toobig.c, and expect this program to start and print its line.
+    @{ Name = "oversized image is refused, not fatal"; Send = @("toobig");
+       Expect = @("program image is too large to load") },
 
     @{ Name = "bigio long I/O";   Send = @("bigio");
        Expect = @("size intact", "ticks during I/O") },
