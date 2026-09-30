@@ -964,7 +964,7 @@ static vtype_t type_ptr_to(vtype_t t) {
 /* ---- 节点 ---- */
 typedef enum {
     ND_NUM, ND_STR, ND_VAR, ND_BIN, ND_ASSIGN, ND_CALL, ND_DEREF, ND_ADDR,
-    ND_MEMBER,
+    ND_MEMBER, ND_INITLIST,
     ND_COND, ND_CAST, ND_NEG, ND_BITNOT, ND_LOGNOT, ND_PREINC, ND_PREDEC,
     ND_POSTINC, ND_POSTDEC,
     ND_BLOCK, ND_IF, ND_WHILE, ND_FOR, ND_DOWHILE, ND_RETURN, ND_BREAK,
@@ -1094,13 +1094,34 @@ static void parse_array_dims(vtype_t* t);
 static void parse_struct_def(const char* name);
 
 static int is_type_kw(void) {
-    return is_kw("int") || is_kw("char") || is_kw("void") || is_kw("struct");
+    return is_kw("int") || is_kw("char") || is_kw("void") || is_kw("struct") ||
+           is_kw("static") || is_kw("const") || is_kw("unsigned") ||
+           is_kw("signed") || is_kw("long") || is_kw("short");
+}
+
+/* 这些词一律接受、但基本忽略。
+ *
+ * 为什么接受：真实 C 代码里到处是 `static int x;`、`unsigned char c;`、
+ * `long n;`，不接受的话一大半现成代码根本进不了编译器。
+ * 为什么忽略：这个编译器只有 32 位 int 和 8 位 char，没有真正的位宽区分，
+ * 也没有跨文件链接（所以 static 在这里没有额外含义），更没有 const 检查。
+ * 接受它们是为了让代码能编译，不是假装支持 —— 这一点写在 README 里。
+ */
+static int is_qualifier_kw(void) {
+    return is_kw("static") || is_kw("const") || is_kw("unsigned") ||
+           is_kw("signed") || is_kw("long") || is_kw("short");
 }
 
 static vtype_t parse_type(void) {
     vtype_t t;
+    int saw_qualifier = 0;
 
     memset(&t, 0, sizeof(t));
+    while (is_qualifier_kw()) {
+        saw_qualifier = 1;
+        lex_next();
+    }
+
     if (accept_kw("int")) {
         t.base = TY_INT;
     } else if (accept_kw("char")) {
@@ -1121,6 +1142,8 @@ static vtype_t parse_type(void) {
         }
         t.is_struct = 1;
         t.sidx = si;
+    } else if (saw_qualifier) {
+        t.base = TY_INT;               /* `unsigned x;` 这种省略写法 */
     } else {
         fatal("expected a type (int / char / void / struct)");
     }
@@ -1838,15 +1861,22 @@ static struct sym* declare_symbol(const char* name, vtype_t t, int kind) {
     return s;
 }
 
-/* 解析 "[N]"（数组维度，最多支持到 4 维里的一维，见 README 说明） */
+/* 解析 "[N]"。N 可以留空（`char s[] = "abc"`）：那时 dims 记 0，
+ * 由初始化列表/字符串的个数回填（见 parse_declaration）。
+ * 最多支持 4 维。 */
 static void parse_array_dims(vtype_t* t) {
     while (is_punct("[")) {
         lex_next();
-        if (tok.kind != TK_NUM) {
-            fatal("array size must be a number");
-        }
         if (t->ndims >= 4) {
             fatal("at most 4 array dimensions are supported");
+        }
+        if (t->ndims == 0 && is_punct("]")) {
+            t->dims[t->ndims++] = 0;        /* 留空，等初始化列表补 */
+            lex_next();
+            continue;
+        }
+        if (tok.kind != TK_NUM) {
+            fatal("array size must be a number (or empty, with an initialiser)");
         }
         t->dims[t->ndims++] = tok.num;
         lex_next();
@@ -2023,15 +2053,69 @@ static node_t* parse_declaration(int eat_semi) {
             vtype_t t = base;
             struct sym* s;
             node_t* n;
+            int inferred = 0;
 
             parse_array_dims(&t);
+            if (t.ndims > 0 && t.dims[0] == 0) {
+                inferred = 1;              /* `int a[] = {...}`：长度等下补 */
+            }
             s = declare_symbol(name, t, is_global ? SYM_GLOBAL : SYM_LOCAL);
 
             n = node_new(ND_DECL);
             copy_str_local(n->name, name, sizeof(n->name));
             n->sym = s;
+
             if (accept_punct("=")) {
-                n->a = (tok.kind == TK_STR) ? parse_primary() : parse_assign();
+                if (is_punct("{")) {
+                    /* 初始化列表：逐个表达式，用 next 串起来 */
+                    node_t* list = node_new(ND_INITLIST);
+                    node_t* itail = NULL;
+                    int count = 0;
+
+                    lex_next();            /* 吃掉 '{' */
+                    while (!is_punct("}")) {
+                        node_t* e = parse_assign();
+
+                        if (itail) {
+                            itail->next = e;
+                        } else {
+                            list->a = e;
+                        }
+                        itail = e;
+                        count++;
+                        if (!accept_punct(",")) {
+                            break;
+                        }
+                    }
+                    expect_punct("}");
+                    if (count == 0) {
+                        fatal("empty initialiser list");
+                    }
+                    list->num = count;     /* 元素个数 */
+                    n->a = list;
+
+                    if (inferred) {
+                        t.dims[0] = count;
+                        s->nelem = count;
+                        s->size = type_size(t);
+                    } else if (count > t.dims[0]) {
+                        fatal("too many initialisers for '%s' (%d > %d)",
+                              name, count, t.dims[0]);
+                    }
+                } else if (tok.kind == TK_STR) {
+                    n->a = parse_primary();
+
+                    if (inferred) {
+                        /* `char s[] = "abc"` -> 长度是 strlen + 1 */
+                        t.dims[0] = n->a->str_len + 1;
+                        s->nelem = t.dims[0];
+                        s->size = type_size(t);
+                    }
+                } else {
+                    n->a = parse_assign();
+                }
+            } else if (inferred) {
+                fatal("'%s' has no size and no initialiser", name);
             }
 
             if (tail) {
@@ -2716,7 +2800,83 @@ static void gen_stmt(node_t* n) {
 
         case ND_DECL:
             if (n->a) {
-                /* 局部变量的初值：等于一次赋值 */
+                /* 初始化列表：数组逐个元素赋值（元素可以是任意表达式，
+                 * 因为这是一条语句，不像全局那样要求常量） */
+                if (n->a->kind == ND_INITLIST) {
+                    vtype_t at_ty = sym_vtype(n->sym);
+                    vtype_t el_ty = type_element(at_ty);
+                    int esize = type_size(el_ty);
+                    int i = 0;
+
+                    for (node_t* e = n->a->a; e; e = e->next) {
+                        gen_addr_var(n->sym);
+                        if (i * esize != 0) {
+                            e_mov_r_imm(R_ECX, (uint32_t)(i * esize));
+                            e_alu_rr(ALU_ADD, R_EAX, R_ECX);
+                        }
+                        e_push(R_EAX);
+                        gen_expr(e);
+                        e_mov_rr(R_ECX, R_EAX);
+                        e_pop(R_EAX);
+                        gen_store(el_ty);
+                        i++;
+                    }
+                    return;
+                }
+
+                /* 字符串初始化局部 char 数组：逐字节抄。
+                 * （第一版这里直接报错，现在真正生成代码 —— 写法常见，
+                 * 而且逐字节抄一共就几条指令。）
+                 *
+                 * 判断类型必须看**符号**（sym_vtype），不能看 n->ty：
+                 * ND_DECL 节点上的 ty 从来没设过，默认是 int —— 第一版
+                 * 就是栽在这儿，字符串初始化走了"当指针存 4 字节"那条路，
+                 * lbuf[0] 变成了地址的低字节，puts 打出来一个不可见字符。 */
+                if (n->a->kind == ND_STR) {
+                    vtype_t dt = sym_vtype(n->sym);
+
+                    if (dt.ndims > 0 && dt.ptr == 0 && dt.base == TY_CHAR) {
+                        int len = n->a->str_len + 1;      /* 含结尾的 0 */
+                        int room = type_size(dt);
+
+                        if (len > room) {
+                            fatal("initialiser for '%s' does not fit (%d > %d)",
+                                  n->name, len, room);
+                        }
+                        for (int i = 0; i < len; i++) {
+                            /* 目标地址 -> eax */
+                            gen_addr_var(n->sym);
+                            if (i != 0) {
+                                e_mov_r_imm(R_ECX, (uint32_t)i);
+                                e_alu_rr(ALU_ADD, R_EAX, R_ECX);
+                            }
+                            e_push(R_EAX);
+                            /* 源字节：字符串字面量基址 + i，读一个字节 */
+                            gen_string_literal(n->a);
+                            if (i != 0) {
+                                e_mov_r_imm(R_ECX, (uint32_t)i);
+                                e_alu_rr(ALU_ADD, R_EAX, R_ECX);
+                            }
+                            e_load8(R_EAX, R_EAX, 0);
+                            e_mov_rr(R_ECX, R_EAX);
+                            e_pop(R_EAX);
+                            e_store8(R_ECX, R_EAX, 0);
+                        }
+                        return;
+                    }
+                }
+
+                /* 结构体不能从另一个结构体初始化（要逐字段抄，或者用指针） */
+                {
+                    vtype_t dt = sym_vtype(n->sym);
+
+                    if (dt.is_struct && dt.ptr == 0) {
+                        fatal("cannot initialise the struct '%s' from an "
+                              "expression; assign its members instead", n->name);
+                    }
+                }
+
+                /* 其它情况：等于一次赋值 */
                 gen_addr_var(n->sym);
                 e_push(R_EAX);
                 gen_expr(n->a);
@@ -3069,6 +3229,35 @@ static void layout_globals(void) {
             s->is_bss = 1;
             s->offset = bss_rel_len;
             bss_rel_len += size;
+            continue;
+        }
+
+        if (d->a->kind == ND_INITLIST) {
+            /* 全局数组的初始化列表：元素必须是常量，直接铺进数据区，
+             * 没写到的位置留 0（data_emit_zeros 已经把整块清零了）。 */
+            vtype_t el_ty = type_element(t);
+            int esize = type_size(el_ty);
+            int total = type_size(t);
+            int at = data_emit_zeros(total);
+            int i = 0;
+
+            s->offset = at;
+            for (node_t* e = d->a->a; e && i < d->a->num; e = e->next, i++) {
+                int ok = 0;
+                int v = const_eval(e, &ok);
+
+                if (!ok) {
+                    fatal("initialiser for '%s' must be a constant", s->name);
+                }
+                if (esize == 1) {
+                    data[at + i] = (unsigned char)v;
+                } else if (esize == 4) {
+                    patch32_data(at + i * 4, (uint32_t)v);
+                } else {
+                    fatal("struct elements in an initialiser list are not "
+                          "supported (assign the members instead)");
+                }
+            }
             continue;
         }
 

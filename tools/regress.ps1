@@ -37,11 +37,14 @@ param(
     [switch]$List,
     [string]$Only = "",
     [int]$BootWait = 34,
-    # Typing faster than this makes the guest drop and duplicate scan codes
-    # (and can even produce a spurious mouse-wheel event, which flips the
-    # console into its scrollback view and eats the next key). 60ms looked
-    # fine for a while and then produced "sstes" instead of "systest".
-    [int]$TypeDelayMs = 150,
+    # How fast to type into the guest. 250ms is the conservative default:
+    # VBoxManage keyboardputscancode is a separate process per keystroke, and
+    # on a loaded machine faster values have been seen to drop or duplicate
+    # scan codes ("systest" arriving as "sstes"). If the input looks scrambled
+    # in the log, first make sure nobody else is typing into the same VM -
+    # two input sources at once mangle the stream in exactly the same way.
+    # Raise this with -TypeDelayMs if a run still looks flaky.
+    [int]$TypeDelayMs = 250,
     [int]$StepTimeout = 30
 )
 
@@ -210,6 +213,16 @@ $checks = @(
     @{ Name = "hncc struct output is correct"; Send = @("/share/hncc/t2.lxe");
        Expect = @("1 34", "2 34", "3 42", "4 8", "5 8",
                   "6 40", "7 56", "8 24", "9 43") },
+
+    # Initialiser lists and the qualifier keywords (static/const/unsigned/
+    # long): `int a[] = {1,2,3}` with an inferred size, global and local,
+    # char arrays from a string, and sizeof of an inferred array.
+    @{ Name = "hncc compiles t3.c (initialisers)"; Send = @("hncc /share/hncc/t3.c");
+       Expect = @("compiled /share/hncc/t3\.c") },
+
+    @{ Name = "hncc initialiser output is correct"; Send = @("/share/hncc/t3.lxe");
+       Expect = @("1 1234", "2 hncc", "3 12", "4 30",
+                  "5 ac", "6 5008", "7 xyz", "8 109") },
 
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },
