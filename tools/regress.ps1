@@ -202,6 +202,15 @@ $checks = @(
     @{ Name = "hncc hello runs";  Send = @("/share/hncc/hello.lxe");
        Expect = @("compiled on HNeoC", "counter after the loop") },
 
+    # Structs: local struct, pointer to struct, '->' chains, struct arrays,
+    # sizeof, and passing a struct pointer into a function.
+    @{ Name = "hncc compiles t2.c (structs)"; Send = @("hncc /share/hncc/t2.c");
+       Expect = @("compiled /share/hncc/t2\.c") },
+
+    @{ Name = "hncc struct output is correct"; Send = @("/share/hncc/t2.lxe");
+       Expect = @("1 34", "2 34", "3 42", "4 8", "5 8",
+                  "6 40", "7 56", "8 24", "9 43") },
+
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },
 
@@ -309,6 +318,19 @@ Start-Sleep -Seconds $BootWait
 $state = Get-VmState
 if ($state -ne "running") {
     Write-Bad "the VM did not come up (state: $state)"
+    # Two states people actually hit, both needing a manual nudge:
+    #   aborted-saved : a leftover saved state blocks the boot (usually after
+    #                   a run was killed mid-flight)
+    #   aborted       : a stale VM entry; discardstate or a fresh start fixes it
+    if ($state -match "saved") {
+        Write-Host "  hint: discard the saved state first:" -ForegroundColor Yellow
+        Write-Host "        & `"`$VBoxManage`" discardstate $vmName" -ForegroundColor Yellow
+    }
+    if ($state -eq "unknown") {
+        Write-Host "  hint: VBoxManage could not be reached - stray VirtualBox" -ForegroundColor Yellow
+        Write-Host "        processes from an interrupted run can wedge it:" -ForegroundColor Yellow
+        Write-Host "        taskkill /F /IM VBoxHeadless.exe ; taskkill /F /IM VBoxSVC.exe" -ForegroundColor Yellow
+    }
     exit 1
 }
 Write-Ok "boot ($vmName is running)"

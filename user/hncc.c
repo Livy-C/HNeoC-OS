@@ -782,6 +782,8 @@ struct sym {
     int  func_index;    /* SYM_FUNC 用：函数下标 */
     int  is_bss;        /* 全局：在 bss 区吗 */
     int  defined;       /* 全局变量/函数是否已经定义 */
+    int  is_struct;     /* 是结构体类型吗 */
+    int  sidx;          /* is_struct 时：结构体下标 */
 };
 
 /* ---- 类型 ---- */
@@ -822,7 +824,39 @@ typedef struct {
     int ptr;         /* 指针层数 */
     int dims[4];     /* 数组各维长度 */
     int ndims;
+    int is_struct;   /* 是结构体吗（0 表示不是 —— 这样 memset 出来的默认值就对了） */
+    int sidx;        /* is_struct 时：结构体在结构体表里的下标 */
 } vtype_t;
+
+/* ---- 结构体表 ----
+ *
+ * 字段偏移在定义时就算好（每个字段 4 字节对齐，整体大小也向上取整到 4）。
+ * 之所以不做紧凑排列：这个编译器只处理 int / char / 指针，
+ * 对齐到 4 之后所有字段的访存都是对齐的，反汇编出来也好读。
+ */
+#define MAX_STRUCTS 32
+#define MAX_FIELDS  16
+
+typedef struct {
+    char    name[32];
+    int     nfields;
+    char    fname[MAX_FIELDS][24];
+    vtype_t ftype[MAX_FIELDS];
+    int     offset[MAX_FIELDS];
+    int     size;
+} struct_def_t;
+
+static struct_def_t structs[MAX_STRUCTS];
+static int struct_n;
+
+static int find_struct(const char* name) {
+    for (int i = 0; i < struct_n; i++) {
+        if (strcmp(structs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 static int base_size(int base) {
     if (base == TY_CHAR) {
@@ -840,11 +874,43 @@ static int type_size(vtype_t t) {
     if (t.ptr > 0) {
         return 4;
     }
-    n = base_size(t.base);
+    if (t.is_struct) {
+        n = structs[t.sidx].size;
+    } else {
+        n = base_size(t.base);
+    }
     for (int i = 0; i < t.ndims; i++) {
         n *= t.dims[i];
     }
     return n;
+}
+
+/* 结构体的某个字段 */
+static int field_offset(vtype_t t, const char* name) {
+    const struct_def_t* d;
+
+    if (!t.is_struct) {
+        return -1;
+    }
+    d = &structs[t.sidx];
+    for (int i = 0; i < d->nfields; i++) {
+        if (strcmp(d->fname[i], name) == 0) {
+            return d->offset[i];
+        }
+    }
+    return -1;
+}
+
+static vtype_t field_type(vtype_t t, const char* name) {
+    const struct_def_t* d = &structs[t.sidx];
+
+    for (int i = 0; i < d->nfields; i++) {
+        if (strcmp(d->fname[i], name) == 0) {
+            return d->ftype[i];
+        }
+    }
+    fatal("no member named '%s'", name);
+    return t;
 }
 
 /* 去掉一层：指针 -> 下一层指针或基类型；数组 -> 少一维 */
@@ -898,6 +964,7 @@ static vtype_t type_ptr_to(vtype_t t) {
 /* ---- 节点 ---- */
 typedef enum {
     ND_NUM, ND_STR, ND_VAR, ND_BIN, ND_ASSIGN, ND_CALL, ND_DEREF, ND_ADDR,
+    ND_MEMBER,
     ND_COND, ND_CAST, ND_NEG, ND_BITNOT, ND_LOGNOT, ND_PREINC, ND_PREDEC,
     ND_POSTINC, ND_POSTDEC,
     ND_BLOCK, ND_IF, ND_WHILE, ND_FOR, ND_DOWHILE, ND_RETURN, ND_BREAK,
@@ -915,9 +982,11 @@ typedef struct node {
     int     str_len;
     char    str[256];
     int     data_ready;    /* ND_STR：是否已经在数据区里放过一份 */
-    char    name[64];      /* ND_VAR / ND_CALL */
+    char    name[64];      /* ND_VAR / ND_CALL；ND_MEMBER：字段名 */
     struct sym* sym;       /* ND_VAR / ND_DECL：变量；ND_CALL：函数用 func_index */
     int     func_index;
+    int     field_off;     /* ND_MEMBER：字段在结构体里的偏移 */
+    int     via_ptr;       /* ND_MEMBER：是 p->f（1）还是 a.f（0） */
     struct node* a;
     struct node* b;
     struct node* c;
@@ -1021,9 +1090,11 @@ static node_t* parse_stmt(void);
 static node_t* parse_block(void);
 static vtype_t parse_type(void);
 static node_t* parse_declaration(int eat_semi);
+static void parse_array_dims(vtype_t* t);
+static void parse_struct_def(const char* name);
 
 static int is_type_kw(void) {
-    return is_kw("int") || is_kw("char") || is_kw("void");
+    return is_kw("int") || is_kw("char") || is_kw("void") || is_kw("struct");
 }
 
 static vtype_t parse_type(void) {
@@ -1036,13 +1107,97 @@ static vtype_t parse_type(void) {
         t.base = TY_CHAR;
     } else if (accept_kw("void")) {
         t.base = TY_VOID;
+    } else if (is_kw("struct")) {
+        char sname[32];
+        int si;
+
+        lex_next();
+        expect_ident(sname, sizeof(sname));
+        si = find_struct(sname);
+        if (si < 0) {
+            /* 结构体必须先定义再用：没有前向声明，也不做"用到了再补"的推断。
+             * 报错比默默当成 int 好得多。 */
+            fatal("unknown struct '%s' (define it before using it)", sname);
+        }
+        t.is_struct = 1;
+        t.sidx = si;
     } else {
-        fatal("expected a type (int / char / void)");
+        fatal("expected a type (int / char / void / struct)");
     }
     while (accept_punct("*")) {
         t.ptr++;
     }
     return t;
+}
+
+/* struct T { ... }; —— 调用方已经把 "struct T" 和 '{' 都看过了 */
+static void parse_struct_def(const char* name)
+{
+    int si = find_struct(name);
+    struct_def_t* d;
+    int off = 0;
+
+    if (si < 0) {
+        if (struct_n >= MAX_STRUCTS) {
+            fatal("too many struct types (limit %d)", MAX_STRUCTS);
+        }
+        si = struct_n++;
+        memset(&structs[si], 0, sizeof(structs[si]));
+        copy_str_local(structs[si].name, name, sizeof(structs[si].name));
+    } else if (structs[si].nfields > 0) {
+        fatal("struct '%s' is already defined", name);
+    }
+    d = &structs[si];
+
+    /* 这里已经把结构体登记进表里了，所以 "struct T* next;" 这种自引用
+     * 指针字段能解析 —— 指针大小是 4，不需要知道结构体本身多大。 */
+    lex_next();                        /* 吃掉 '{' */
+
+    while (!is_punct("}")) {
+        vtype_t base = parse_type();
+
+        if (tok.kind == TK_EOF) {
+            fatal("unexpected end of file inside struct '%s'", name);
+        }
+
+        for (;;) {
+            char fn[24];
+            vtype_t ft = base;
+
+            expect_ident(fn, sizeof(fn));
+            if (is_punct("[")) {
+                parse_array_dims(&ft);
+            }
+            if (d->nfields >= MAX_FIELDS) {
+                fatal("struct '%s' has too many fields (limit %d)",
+                      name, MAX_FIELDS);
+            }
+            if (ft.is_struct && ft.ptr == 0 && ft.sidx == si) {
+                fatal("struct '%s' cannot contain itself (use a pointer)", name);
+            }
+
+            while ((off % 4) != 0) {   /* 每个字段 4 字节对齐 */
+                off++;
+            }
+            copy_str_local(d->fname[d->nfields], fn, sizeof(d->fname[0]));
+            d->ftype[d->nfields]  = ft;
+            d->offset[d->nfields] = off;
+            off += type_size(ft);
+            d->nfields++;
+
+            if (!accept_punct(",")) {
+                break;
+            }
+        }
+        expect_punct(";");
+    }
+    lex_next();                        /* 吃掉 '}' */
+    expect_punct(";");
+
+    while ((off % 4) != 0) {           /* 整体大小也向上取整到 4 */
+        off++;
+    }
+    d->size = off;
 }
 
 /* 二元：都从子层拿左值，遇到对应的运算符就继续往上套 */
@@ -1277,6 +1432,13 @@ static node_t* parse_assign(void) {
                 n->b = parse_assign();
                 copy_str_local(n->opstr, op, sizeof(n->opstr));
                 n->ty = lhs->ty;
+
+                /* 整个结构体赋值要生成一块 memcpy，这个编译器不做：
+                 * 明确拒绝，比生成半截拷贝安全。逐字段抄或者用指针。 */
+                if (lhs->ty.is_struct && lhs->ty.ptr == 0) {
+                    fatal("assigning whole structs is not supported "
+                          "(assign the members, or use a pointer)");
+                }
                 return n;
             }
         }
@@ -1510,6 +1672,11 @@ static node_t* parse_primary(void) {
             n->ty.ptr = s->ptr;
             n->ty.base = s->base;
             n->ty.ndims = 0;
+            /* 结构体信息也要带上：漏了它，"struct point* p" 里的 p 在表达式里
+             * 就变成"不是结构体"，p->x 会报 "'->' needs a pointer to a struct"
+             * —— 明明声明的类型是对的。符号表里存了，这里必须一起搬过来。 */
+            n->ty.is_struct = s->is_struct;
+            n->ty.sidx = s->sidx;
             if (s->nelem > 0) {
                 n->ty.ndims = 1;
                 n->ty.dims[0] = s->nelem;
@@ -1575,7 +1742,43 @@ static node_t* parse_postfix(void) {
             n->a = add;
             n->ty = type_element(add->ty);
         } else if (is_punct(".") || is_punct("->")) {
-            fatal("struct members are not supported");
+            /* 成员访问：a.f 和 p->f。
+             *
+             * 两者的区别只在"结构体地址从哪来"：a.f 取变量 a 的地址，
+             * p->f 用 p 里存的那个地址。所以节点里用 via_ptr 记一下，
+             * 代码生成时按需取地址/取值即可。 */
+            int via_ptr = (tok.punct[0] == '-');
+            char fname[24];
+            vtype_t sty;
+            node_t* m;
+            int off;
+
+            lex_next();
+            expect_ident(fname, sizeof(fname));
+
+            sty = n->ty;
+            if (via_ptr) {
+                if (sty.ptr == 0 || !sty.is_struct) {
+                    fatal("'->' needs a pointer to a struct");
+                }
+                sty.ptr--;                 /* 指向的结构体类型 */
+            }
+            if (!sty.is_struct || sty.ptr != 0) {
+                fatal("'.' needs a struct (got something else)");
+            }
+            off = field_offset(sty, fname);
+            if (off < 0) {
+                fatal("struct '%s' has no member named '%s'",
+                      structs[sty.sidx].name, fname);
+            }
+
+            m = node_new(ND_MEMBER);
+            m->a = n;
+            m->via_ptr = via_ptr;
+            m->field_off = off;
+            copy_str_local(m->name, fname, sizeof(m->name));
+            m->ty = field_type(sty, fname);
+            n = m;
         } else if (is_punct("++")) {
             node_t* p = node_new(ND_POSTINC);
 
@@ -1630,6 +1833,8 @@ static struct sym* declare_symbol(const char* name, vtype_t t, int kind) {
     s->nelem  = (t.ndims > 0) ? t.dims[0] : 0;
     s->type   = t.base;
     s->size   = type_size(t);
+    s->is_struct = t.is_struct;
+    s->sidx      = t.sidx;
     return s;
 }
 
@@ -1649,14 +1854,43 @@ static void parse_array_dims(vtype_t* t) {
     }
 }
 
-/* 一条声明：可能是全局变量、函数原型或函数定义。
+/* 一条声明：可能是结构体定义、全局变量、函数原型或函数定义。
  *
  * 变量声明返回一个 ND_DECL 的链（"int a = 1, b;" 是两个节点），
  * 函数原型和函数定义返回 NULL —— 它们不需要可执行代码。 */
 static node_t* parse_declaration(int eat_semi) {
-    vtype_t base = parse_type();
+    vtype_t base;
     char name[64];
     int is_global = parsing_global;
+
+    /* 先看是不是 "struct T { ... };" 这种定义。
+     * 只看当前 token 分不清 "struct T {" 和 "struct T x;"，所以要往后看一个：
+     * 词法器只有一个 token 的前看量，用"存下位置再退回来"的老办法。 */
+    if (is_kw("struct")) {
+        const char* save_p    = lex_p;
+        token_t     save_tok  = tok;
+        int         save_line = src_line;
+        char        sname[32];
+        int         is_def    = 0;
+
+        lex_next();
+        if (tok.kind == TK_IDENT) {
+            copy_str_local(sname, tok.text, sizeof(sname));
+            lex_next();
+            if (is_punct("{")) {
+                is_def = 1;
+            }
+        }
+        if (is_def) {
+            parse_struct_def(sname);       /* 吃掉 body 和结尾的 ';' */
+            return NULL;
+        }
+        lex_p    = save_p;
+        tok      = save_tok;
+        src_line = save_line;
+    }
+
+    base = parse_type();
 
     if (tok.kind != TK_IDENT) {
         fatal("expected a variable or function name");
@@ -1695,6 +1929,13 @@ static node_t* parse_declaration(int eat_semi) {
         f->ret = base;
         f->nparams = 0;
 
+        /* 结构体只能通过指针传递/返回。
+         * 按值传递要生成一份拷贝，这个编译器的调用约定不做这件事 ——
+         * 与其生成错的代码，不如在这里明确拒绝。 */
+        if (base.is_struct && base.ptr == 0) {
+            fatal("'%s' returns a struct by value; use a pointer instead", name);
+        }
+
         lex_next();                       /* 吃掉 '(' */
         if (!is_punct(")")) {
             /* "void" 有两种意思：
@@ -1729,6 +1970,10 @@ static node_t* parse_declaration(int eat_semi) {
                     expect_ident(pn, sizeof(pn));
                     if (is_punct("[")) {
                         parse_array_dims(&pt);
+                    }
+                    if (pt.is_struct && pt.ptr == 0) {
+                        fatal("parameter '%s' is a struct by value; use a pointer",
+                              pn);
                     }
                     if (f->nparams >= 8) {
                         fatal("at most 8 parameters are supported");
@@ -1977,6 +2222,8 @@ static vtype_t sym_vtype(const struct sym* s) {
     memset(&t, 0, sizeof(t));
     t.base = s->base;
     t.ptr = s->ptr;
+    t.is_struct = s->is_struct;
+    t.sidx = s->sidx;
     if (s->nelem > 0) {
         t.ndims = 1;
         t.dims[0] = s->nelem;
@@ -2027,6 +2274,20 @@ static void gen_addr(node_t* n) {
         case ND_DEREF:
             /* *p 的地址就是 p 的值 */
             gen_expr(n->a);
+            return;
+
+        case ND_MEMBER:
+            /* a.f  ->  取 a 的地址，再加上字段偏移
+             * p->f ->  取 p 的值（就是结构体地址），再加上字段偏移 */
+            if (n->via_ptr) {
+                gen_expr(n->a);
+            } else {
+                gen_addr(n->a);
+            }
+            if (n->field_off != 0) {
+                e_mov_r_imm(R_ECX, (uint32_t)n->field_off);
+                e_alu_rr(ALU_ADD, R_EAX, R_ECX);
+            }
             return;
 
         default:
@@ -2357,6 +2618,16 @@ static void gen_expr(node_t* n) {
         case ND_DEREF:
             gen_expr(n->a);
             gen_load(n->ty);
+            return;
+
+        case ND_MEMBER:
+            /* 和 ND_VAR 一个道理：数组字段的名字当地址用，别的都要取值，
+             * 指针字段也要把它存的地址读出来。整个结构体不能当值用
+             * （解析阶段已经拒绝赋值了），所以到这里的都是能取的值。 */
+            gen_addr(n);
+            if (n->ty.ndims == 0) {
+                gen_load(n->ty);
+            }
             return;
 
         case ND_ADDR:
