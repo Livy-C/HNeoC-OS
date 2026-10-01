@@ -11,8 +11,14 @@
  * 顺序读一遍：宿主机打包时顺序写出来，OS 上安装时顺序读进去。
  *
  *   [0        .. 255]  包头
- *   [256      ..    ]  文件表，HNPKG_MAX_FILES 项，每项 64 字节
+ *   [256      ..    ]  文件表，file_count 项（最多 HNPKG_MAX_FILES 项），每项 64 字节
  *   [data_offset .. ]  文件数据（所有文件首尾相接，表里的 offset 相对这里）
+ *
+ * 表是**变长**的：文件里只写 file_count 项，data_offset 就紧跟在最后一项后面
+ * （data_offset = table_offset + HNPKG_ENTRY_SIZE * file_count），表后面既没有
+ * 空槽也没有填充。所以 file_count 决定表有多大，两者必须互相自洽 —— hpm.c 的
+ * read_header 会把"表放得下"和"数据起点不超过文件尾"两条都验一遍。
+ * 真实的小包就是这个样子：file_count = 1、data_offset = 320。
  *
  * 文件表里的 path 是**相对根的路径**（"bin/hi.lxe"、"share/hello/about.txt"），
  * 安装时直接拼在 "/" 后面；mode 是 HNeoFS 的权限位，安装时用 chmod 设回去，
@@ -35,7 +41,8 @@
 #define HNPKG_VER_MAX     16
 #define HNPKG_DEPENDS_MAX 48           /* 逗号分隔的包名列表 */
 #define HNPKG_SUMMARY_MAX 96
-#define HNPKG_MAX_FILES   32
+#define HNPKG_MAX_FILES   32           /* 文件表里最多能有几项 */
+#define HNPKG_ENTRY_SIZE  64           /* 文件表一项多大，见下面的 hnpkg_entry_t */
 
 /* 包头标志 */
 #define HNPKG_FLAG_ADMIN 0x0001u       /* 只有管理员能安装 */

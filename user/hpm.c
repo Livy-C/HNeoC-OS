@@ -22,10 +22,35 @@
 #include <hneoc.h>
 #include <hnpkg.h>
 
-/* 包头/表项的布局必须和 hnpkg.h 完全一致，这几行是编译期断言：
- * 布局一旦被改错，这里直接编不过，而不是等到装包时错位。 */
+/* 包头/表项的布局必须和 hnpkg.h 完全一致，下面这些是编译期断言：
+ * 布局一旦被改错，这里直接编不过，而不是等到装包时错位。
+ *
+ * 只断言 sizeof 是不够的：hnpkg_header_t 的 reserved[] 是"剩下的都归我"
+ * （HNPKG_HEADER_SIZE - 8 - sizeof(hnpkg_info_t) - 4），所以把
+ * HNPKG_NAME_MAX 改小一格，后面所有字段都往前挪，而 sizeof 还是整整 256，
+ * 断言照样过 —— 然后每一个字段都读错。所以字段的**偏移**也要一个个钉住；
+ * 下面的数字就是宿主机那侧 tools/mkhnpkg.ps1 里 $OFF_* / $EOFF_* 算出来的
+ * 那组值，也是 build.ps1 读包头时用的字面量。 */
 typedef char hpm_check_hdr[(sizeof(hnpkg_header_t) == HNPKG_HEADER_SIZE) ? 1 : -1];
-typedef char hpm_check_ent[(sizeof(hnpkg_entry_t) == 64) ? 1 : -1];
+typedef char hpm_check_ent[(sizeof(hnpkg_entry_t) == HNPKG_ENTRY_SIZE) ? 1 : -1];
+
+_Static_assert(offsetof(hnpkg_header_t, magic) == 0,   "hnpkg header: magic must be at offset 0");
+_Static_assert(offsetof(hnpkg_header_t, version) == 4, "hnpkg header: version must be at offset 4");
+_Static_assert(offsetof(hnpkg_header_t, info.name) == 8,          "hnpkg header: name must be at offset 8");
+_Static_assert(offsetof(hnpkg_header_t, info.version) == 40,      "hnpkg header: version field must be at offset 40");
+_Static_assert(offsetof(hnpkg_header_t, info.depends) == 56,      "hnpkg header: depends must be at offset 56");
+_Static_assert(offsetof(hnpkg_header_t, info.summary) == 104,     "hnpkg header: summary must be at offset 104");
+_Static_assert(offsetof(hnpkg_header_t, info.file_count) == 200,  "hnpkg header: file_count must be at offset 200");
+_Static_assert(offsetof(hnpkg_header_t, info.data_offset) == 204, "hnpkg header: data_offset must be at offset 204");
+_Static_assert(offsetof(hnpkg_header_t, info.total_size) == 208,  "hnpkg header: total_size must be at offset 208");
+_Static_assert(offsetof(hnpkg_header_t, info.flags) == 212,       "hnpkg header: flags must be at offset 212");
+_Static_assert(offsetof(hnpkg_header_t, table_offset) == 216,     "hnpkg header: table_offset must be at offset 216");
+
+_Static_assert(offsetof(hnpkg_entry_t, path) == 0,      "hnpkg entry: path must be at offset 0");
+_Static_assert(offsetof(hnpkg_entry_t, offset) == 48,   "hnpkg entry: offset must be at offset 48");
+_Static_assert(offsetof(hnpkg_entry_t, size) == 52,     "hnpkg entry: size must be at offset 52");
+_Static_assert(offsetof(hnpkg_entry_t, mode) == 56,     "hnpkg entry: mode must be at offset 56");
+_Static_assert(offsetof(hnpkg_entry_t, reserved) == 60, "hnpkg entry: reserved must be at offset 60");
 
 #define MAX_RECS      32
 #define MAX_FILES     32
@@ -304,10 +329,27 @@ static int read_header(const char* pkgpath, hnpkg_header_t* h, int* out_fd) {
         close(fd);
         return -1;
     }
-    if (h->info.file_count > HNPKG_MAX_FILES || h->info.data_offset < HNPKG_HEADER_SIZE) {
+    /* 表必须紧跟在包头后面：table_offset 恒为 HNPKG_HEADER_SIZE。
+     * 这一条不成立的话，表项根本不在我们刚读进来的这 256 字节之后，
+     * 后面按 file_count 去读表就是在读别人的数据。 */
+    if (h->table_offset != HNPKG_HEADER_SIZE) {
         close(fd);
         return -1;
     }
+    /* 表是变长的，先卡住 file_count 的上限，下面的乘法才不会溢出。 */
+    if (h->info.file_count > HNPKG_MAX_FILES) {
+        close(fd);
+        return -1;
+    }
+    /* data_offset 至少要把 file_count 项的表放下（表正好跟着包头，
+     * 所以下限是 HNPKG_HEADER_SIZE + 64 * file_count）。少一个字节就说明
+     * 表已经长到数据区里去了，读出来的表项和数据全错位。 */
+    if (h->info.data_offset <
+        (uint32_t)HNPKG_HEADER_SIZE + (uint32_t)HNPKG_ENTRY_SIZE * h->info.file_count) {
+        close(fd);
+        return -1;
+    }
+    /* 数据起点不能超过文件本身，否则每个文件的 offset 都指到文件外面。 */
     if (h->info.data_offset > h->info.total_size) {
         close(fd);
         return -1;
@@ -377,7 +419,12 @@ static int db_get_version(const char* name, char* out, int max) {
 
         p = next_line(p);
         if (line[0] == HPM_DB_PKG && line[1] == ' ') {
-            char* nm = line + 2;
+            /* 名字前也要 ltrim，和 db_pkg_installed 一致：数据库是纯文本，
+             * 手工编辑会出现 "p  hello 1.0" 这种两个空格的行。直接取
+             * line + 2 的话 nm 就是 " hello"，第一个空格被当成"名字和版本
+             * 的分隔符"切掉，比出来是个空串 —— 症状是"装是装了，但版本取
+             * 不到"。 */
+            char* nm = ltrim(line + 2);
             char* sp = strchr(nm, ' ');
 
             if (sp) {
@@ -410,7 +457,9 @@ static int db_list_files(const char* name, char paths[][PATH_CAP], int max) {
 
         p = next_line(p);
         if (line[0] == HPM_DB_FILE_ && line[1] == ' ') {
-            char* nm = line + 2;
+            /* 同样先 ltrim 名字："f  hello bin/hi.lxe" 这种多一个空格的行
+             * 也要能认出来，否则 hpm files 会说什么都没装。 */
+            char* nm = ltrim(line + 2);
             char* sp = strchr(nm, ' ');
 
             if (sp) {
@@ -481,7 +530,10 @@ static int db_remove(const char* name) {
         p = next_line(p);
 
         if ((line[0] == HPM_DB_PKG || line[0] == HPM_DB_FILE_) && line[1] == ' ') {
-            char* nm = line + 2;
+            /* 名字前先 ltrim，理由同 db_pkg_installed / db_get_version：
+             * 手工编辑过的 "p  hello 1.0" 里名字前面多一个空格，不 ltrim
+             * 就永远比不相等 —— 于是 hpm remove 说删掉了，其实一行都没删。 */
+            char* nm = ltrim(line + 2);
             char* sp = strchr(nm, ' ');
 
             if (sp) {

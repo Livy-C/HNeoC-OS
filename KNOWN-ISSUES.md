@@ -89,7 +89,9 @@ int main(void) { puts("huge"); return 0; }
 > `user/toobig.c`（64KB 有初值数组，约 65KB 镜像）专门验证这条护栏，
 > `tools/regress.ps1` 里有一条检查盯着它。
 > 自带程序里最大的镜像是故意超限的 `toobig.lxe`（约 65KB），它就是为这条护栏
-准备的对照；正常程序里最大的是 `hncc.lxe`（48KB），不受影响。
+准备的对照；正常程序里最大的是 `hncc.lxe`（约 55KB —— 加上 `enum`/`switch`、
+`typedef` 和几段诊断之后又长了几 KB），不受影响，但离 60KB 只剩 5KB 出头。
+下面那条"只发射用到的运行时函数"因此不只是省空间，也是在给这个上限留活路。
 > 缺陷修好之后，把这个宏、`toobig.c` 和那条检查一起删掉即可。
 >
 > **(6) 下一步该做的实验**：
@@ -176,8 +178,8 @@ panic，并把入口名、当时 esp、返回地址打出来。
 | `hneoc.h` 里有坏字符 | `user/lib/include/hneoc.h` | 早先一次编辑把 24 个多字节汉字截断成了 U+FFFD，只在注释里，不影响编译 |
 | 口令哈希不是安全 | `kernel/user.c` | djb2 无盐、算法公开，能写 `/etc/passwd` 就能加账户；只做到"明文不落盘" |
 | `/home` 是 0777 | `tools/mkfs.ps1` | 没有用户组、也没有"每个用户一个私有目录"的机制，只好让所有用户都能在 `/home` 下建目录 |
-| hncc 只支持 C 子集 | `user/hncc.c` | 还缺：浮点、真正的预处理器、多文件编译，以及初始化列表里的嵌套数组和结构体元素（结构体、变参 / `printf`、初始化列表、`static` 等修饰词都已实现，并有回归检查覆盖） |
-| hncc 总是把整个运行时编进去 | `user/hncc.c` | 没做"只发射用到的函数"，小程序的产物也有几 KB 是运行时 |
+| hncc 只支持 C 子集 | `user/hncc.c` | 还缺：浮点、真正的预处理器、多文件编译，以及初始化列表里的嵌套数组和结构体元素（结构体、`enum`/`switch`、`typedef`、变参 / `printf`、初始化列表、`static` 等修饰词都已实现，并有回归检查覆盖） |
+| 局部变量不能和 typedef 名重名 | `user/hncc.c` | `typedef int T;` 之后再写 `int T;`，那个位置会被当成类型名（`is_type_kw()` 把 typedef 名算作类型）。真实代码里少见，所以只在 README 里说明，没做符号表分层 |
+| hncc 总是把整个运行时编进去 | `user/hncc.c` | 没做"只发射用到的函数"，小程序的产物也有几 KB 是运行时（`hncc.lxe` 自己已经 55KB，离 60KB 的加载上限只剩 5KB 出头，这条迟早要做） |
 | hpm 不做版本升级 | `user/hpm.c` | `install` 只判断"装没装过"，不比较版本；也没有 `upgrade` |
 | hpm 卸载后留下空目录 | `user/hpm.c` | 只删文件、不删目录（没有 rmdir），会在屏幕上直说 |
-| `fsstat` 打出错的魔数 | `kernel/shell.c` | 那行说明是硬写的 `('LVSF')`，实际魔数是 `'HNFS'`（`README.md` 里同类的过期数字已经改正） |

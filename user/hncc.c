@@ -25,7 +25,10 @@
  *   其它   函数（可递归、可前置声明）、全局变量、字符串/字符字面量、
  *          单行与块注释、忽略 #include（见下）
  *
- * 不支持：结构体、浮点、long long、变参函数、真正的前处理、多文件。
+ * 不支持：浮点、long long（当 int 处理）、真正的预处理器、多文件编译、
+ *         初始化列表里的嵌套数组与结构体元素。
+ *         结构体只能通过指针传参/返回，也不能整体赋值（解析阶段明确报错）。
+ *         typedef 必须先声明后使用。
  *
  * 运行时是"自己编译自己"：编译器内部带着一段用这个子集写的 C 源码
  * （见文件末尾的 RT_SOURCE），编译用户代码之前先把它编译进去，
@@ -47,11 +50,19 @@
 #define CODE_CAP   (96 * 1024)
 #define DATA_CAP   (96 * 1024)
 #define SRC_CAP    (96 * 1024)
-#define ARENA_CAP  (512 * 1024)
+/* 语法树的缓冲区（只涨不回收）。
+ *
+ * 512KB 曾经够用，但运行时本身（strlen/printf/malloc/字符串函数……）
+ * 就要吃掉 527KB —— 一超就是"任何文件都编译不了"，而且报的是
+ * "out of compiler memory"，看着像用户的程序太大，实际是自己撑爆的。
+ * 现在给到 1MB：用户区有 4MB，hncc 自身的映像 48KB + bss 132KB，够用。
+ * 如果以后还超，优先想办法缩小运行时，而不是继续加这个数。 */
+#define ARENA_CAP  (1024 * 1024)
 #define MAX_LABELS 512
 #define MAX_FIXUPS 1024
 #define MAX_SYMS   128
 #define MAX_LOCALS 128
+#define MAX_CALL_ARGS 16     /* 函数参数最多 8 个，留一倍余量 */
 
 static unsigned char* code;            /* 代码 */
 static int code_len;
@@ -66,6 +77,7 @@ static const char* src_name = "?";
 static void fatal(const char* fmt, ...);
 static void err(const char* what, const char* detail);
 static void patch32_data(int at, uint32_t v);
+static int  find_struct(const char* name);   /* add_constant 要用（它在下面定义） */
 
 static void copy_str_local(char* dst, const char* src, int max) {
     int i = 0;
@@ -256,6 +268,14 @@ static void e_store8(int src, int base, int32_t disp) {
 static void e_lea(int dst, int base, int32_t disp) {
     emit8(0x8D);
     e_modrm_mem(dst, base, disp);
+}
+
+/* mov r32, [esp] —— switch 把待比较的值压在栈顶，取它用。
+ * mod=00 / rm=100 要跟一个 SIB 字节 0x24（base=esp, index=无）。 */
+static void e_load_sp(int dst) {
+    emit8(0x8B);
+    emit8(0x04 | (dst << 3));
+    emit8(0x24);
 }
 
 /* int 0x80 */
@@ -460,10 +480,32 @@ static int is_alnum(int c) { return is_alpha(c) || is_digit(c); }
 /* 跳过一个 # 指令行。
  *
  * 编译器没有真正的预处理器：#include 直接忽略（运行时是内建的），
- * #define 只认最简单的"名字 数字"形式，之后按常量替换。 */
-static char define_names[32][64];
-static int  define_values[32];
+ * #define 只认最简单的"名字 数字"形式，之后按常量替换。
+ * enum 的枚举名也登记进同一张表（见 parse_enum_def）—— 在代码生成阶段
+ * 枚举完全不存在，就是个常量。 */
+#define MAX_CONSTS 64
+
+static char define_names[MAX_CONSTS][64];
+static int  define_values[MAX_CONSTS];
 static int  define_count;
+
+static void add_constant(const char* name, int value) {
+    if (find_struct(name) >= 0) {
+        fatal("'%s' is already a struct name", name);
+    }
+    for (int i = 0; i < define_count; i++) {
+        if (strcmp(define_names[i], name) == 0) {
+            define_values[i] = value;      /* 重定义就覆盖，和 #define 一样 */
+            return;
+        }
+    }
+    if (define_count >= MAX_CONSTS) {
+        fatal("too many constants (#define + enum, limit %d)", MAX_CONSTS);
+    }
+    copy_str_local(define_names[define_count], name, sizeof(define_names[0]));
+    define_values[define_count] = value;
+    define_count++;
+}
 
 static void skip_directive(void) {
     char line[256];
@@ -493,27 +535,32 @@ static void skip_directive(void) {
         while (*p == ' ' || *p == '\t') {
             p++;
         }
-        if (k > 0 && is_digit(*p) && define_count < 32) {
+        if (k > 0 && is_digit(*p)) {
             int v = 0;
 
             while (is_digit(*p)) {
                 v = v * 10 + (*p - '0');
                 p++;
             }
-            copy_str_local(define_names[define_count], name, sizeof(name));
-            define_values[define_count] = v;
-            define_count++;
+            add_constant(name, v);
         }
     }
 }
 
-static int lookup_define(const char* name) {
+/* 查常量表。找到返回 1 并把值写进 *out，没找到返回 0。
+ *
+ * 第一版是"返回 -1 表示没找到"，那样**负数常量就废了**：enum 里
+ * `FAIL = -3` 会让查找结果 -3 被当成"没找到"，于是 FAIL 报
+ * "undeclared variable" —— 明明就在常量表里。用输出参数把"有没有"
+ * 和"值是多少"分开，负数就不再和哨兵值撞车。 */
+static int lookup_define(const char* name, int* out) {
     for (int i = 0; i < define_count; i++) {
         if (strcmp(define_names[i], name) == 0) {
-            return define_values[i];
+            *out = define_values[i];
+            return 1;
         }
     }
-    return -1;
+    return 0;
 }
 
 /* 读下一个 token */
@@ -858,6 +905,27 @@ static int find_struct(const char* name) {
     return -1;
 }
 
+/* 前向声明：`struct node;`。
+ *
+ * 登记一个还没有字段的结构体名（大小 0）。这样互相引用的两个结构体可以写：
+ *     struct b;                 // 先用名字
+ *     struct a { struct b* p; };
+ *     struct b { struct a* q; };
+ * 但"按值"使用一个还没定义完的结构体要在 declare_symbol 里报错 ——
+ * 大小是 0，静默放过去会生成错代码。
+ */
+static void declare_struct_forward(const char* name) {
+    if (find_struct(name) >= 0) {
+        return;                    /* 已经声明过或者已经定义过 */
+    }
+    if (struct_n >= MAX_STRUCTS) {
+        fatal("too many struct types (limit %d)", MAX_STRUCTS);
+    }
+    memset(&structs[struct_n], 0, sizeof(structs[struct_n]));
+    copy_str_local(structs[struct_n].name, name, sizeof(structs[0].name));
+    struct_n++;
+}
+
 static int base_size(int base) {
     if (base == TY_CHAR) {
         return 1;
@@ -868,6 +936,47 @@ static int base_size(int base) {
     return 4;
 }
 
+/* ---- typedef 表 ----
+ *
+ * 名字 -> 类型。只有出现在"类型该出现的位置"时才当类型看（和 C 一样），
+ * 所以这张表只被 parse_type / is_type_kw 查，不会和变量名、函数名打架。
+ * 这也意味着 typedef 必须先声明后使用 —— 在单文件编译器里这是可以接受的。
+ */
+#define MAX_TYPEDEFS 32
+
+typedef struct {
+    char    name[32];
+    vtype_t type;
+} typedef_def_t;
+
+static typedef_def_t typedefs[MAX_TYPEDEFS];
+static int typedef_n;
+static int anon_struct_n;   /* 匿名结构体的编号（typedef struct { ... }） */
+
+static int find_typedef(const char* name) {
+    for (int i = 0; i < typedef_n; i++) {
+        if (strcmp(typedefs[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void add_typedef(const char* name, vtype_t t) {
+    int ti = find_typedef(name);
+
+    if (ti >= 0) {
+        fatal("'%s' is already a typedef", name);
+    }
+    if (typedef_n >= MAX_TYPEDEFS) {
+        fatal("too many typedefs (limit %d)", MAX_TYPEDEFS);
+    }
+    copy_str_local(typedefs[typedef_n].name, name,
+                   sizeof(typedefs[typedef_n].name));
+    typedefs[typedef_n].type = t;
+    typedef_n++;
+}
+
 static int type_size(vtype_t t) {
     int n;
 
@@ -875,6 +984,16 @@ static int type_size(vtype_t t) {
         return 4;
     }
     if (t.is_struct) {
+        if (t.sidx < 0 || t.sidx >= struct_n) {
+            fatal("internal: bad struct index %d", t.sidx);
+        }
+        /* 前向声明过的结构体只有名字、没有大小。原来这里默默返回 0：
+         * `sizeof(struct fwd)` 得到 0，按它算出来的数组和栈槽全是 0 字节，
+         * 写进去就踩到别的东西。C 里这就是"类型不完整"，必须报错。 */
+        if (structs[t.sidx].nfields == 0) {
+            fatal("struct '%s' is incomplete here (only forward-declared); "
+                  "its size is unknown", structs[t.sidx].name);
+        }
         n = structs[t.sidx].size;
     } else {
         n = base_size(t.base);
@@ -968,7 +1087,8 @@ typedef enum {
     ND_COND, ND_CAST, ND_NEG, ND_BITNOT, ND_LOGNOT, ND_PREINC, ND_PREDEC,
     ND_POSTINC, ND_POSTDEC,
     ND_BLOCK, ND_IF, ND_WHILE, ND_FOR, ND_DOWHILE, ND_RETURN, ND_BREAK,
-    ND_CONTINUE, ND_DECL, ND_EXPRSTMT, ND_EMPTY
+    ND_CONTINUE, ND_DECL, ND_EXPRSTMT, ND_EMPTY,
+    ND_SWITCH, ND_CASE, ND_DEFAULT
 } nd_kind;
 
 struct node;
@@ -987,6 +1107,7 @@ typedef struct node {
     int     func_index;
     int     field_off;     /* ND_MEMBER：字段在结构体里的偏移 */
     int     via_ptr;       /* ND_MEMBER：是 p->f（1）还是 a.f（0） */
+    int     label;         /* ND_CASE / ND_DEFAULT：这个分支的代码标签 */
     struct node* a;
     struct node* b;
     struct node* c;
@@ -1092,10 +1213,18 @@ static node_t* parse_block(void);
 static vtype_t parse_type(void);
 static node_t* parse_declaration(int eat_semi);
 static void parse_array_dims(vtype_t* t);
-static void parse_struct_def(const char* name);
+static void parse_struct_def(const char* name, int eat_semi);
+static void parse_enum_def(const char* name);
+static int  parse_case_const(void);
 
 static int is_type_kw(void) {
+    /* typedef 名也算类型名 —— 语法上"这个位置能出现类型吗"是靠它判断的，
+     * 所以 `MyInt x;` 才会被当成声明而不是表达式语句。 */
+    if (tok.kind == TK_IDENT && find_typedef(tok.text) >= 0) {
+        return 1;
+    }
     return is_kw("int") || is_kw("char") || is_kw("void") || is_kw("struct") ||
+           is_kw("enum") ||
            is_kw("static") || is_kw("const") || is_kw("unsigned") ||
            is_kw("signed") || is_kw("long") || is_kw("short");
 }
@@ -1143,6 +1272,17 @@ static vtype_t parse_type(void) {
         }
         t.is_struct = 1;
         t.sidx = si;
+    } else if (is_kw("enum")) {
+        /* `enum Color c;` —— 枚举类型的变量就是 int（枚举名只是常量）。 */
+        char ename[32];
+
+        lex_next();
+        expect_ident(ename, sizeof(ename));
+        t.base = TY_INT;
+    } else if (tok.kind == TK_IDENT && find_typedef(tok.text) >= 0) {
+        /* typedef 出来的名字 */
+        t = typedefs[find_typedef(tok.text)].type;
+        lex_next();
     } else if (saw_qualifier) {
         t.base = TY_INT;               /* `unsigned x;` 这种省略写法 */
     } else {
@@ -1154,8 +1294,13 @@ static vtype_t parse_type(void) {
     return t;
 }
 
-/* struct T { ... }; —— 调用方已经把 "struct T" 和 '{' 都看过了 */
-static void parse_struct_def(const char* name)
+/* struct T { ... }; —— 调用方已经把 "struct T" 和 '{' 都看过了。
+ *
+ * eat_semi 是给 typedef 用的：`typedef struct { ... } Pair;` 里 `}` 后面
+ * 直接就是别名，没有分号（分号在别名后面）。原来这里写死 expect_punct(";")，
+ * 于是匿名结构体 typedef 报 "expected ';' but found '}'"，指到结构体
+ * 结尾那一行上，完全看不出是 typedef 的事。 */
+static void parse_struct_def(const char* name, int eat_semi)
 {
     int si = find_struct(name);
     struct_def_t* d;
@@ -1216,12 +1361,57 @@ static void parse_struct_def(const char* name)
         expect_punct(";");
     }
     lex_next();                        /* 吃掉 '}' */
-    expect_punct(";");
+    if (eat_semi) {
+        expect_punct(";");
+    }
 
     while ((off % 4) != 0) {           /* 整体大小也向上取整到 4 */
         off++;
     }
     d->size = off;
+}
+
+/* enum Name { A, B = 5, C }; —— 调用方已经把 "enum Name" 和 '{' 都看过了。
+ *
+ * 枚举名当成常量登记进 #define 那张表（见 add_constant），所以代码生成
+ * 阶段完全看不到枚举：`if (c == RED)` 里的 RED 在解析时就被换成 0。
+ * 不给枚举建类型表，是因为这个子集里枚举只用来起名字。 */
+static void parse_enum_def(const char* name)
+{
+    int value = 0;
+
+    lex_next();                        /* 吃掉 '{' */
+
+    while (!is_punct("}")) {
+        char ename[64];
+        int  neg = 0;
+
+        expect_ident(ename, sizeof(ename));
+
+        if (accept_punct("=")) {
+            if (accept_punct("-")) {
+                neg = 1;
+            }
+            if (tok.kind != TK_NUM) {
+                fatal("enum '%s': the value of '%s' must be a number",
+                      name, ename);
+            }
+            value = (int)tok.num;
+            if (neg) {
+                value = -value;
+            }
+            lex_next();
+        }
+
+        add_constant(ename, value);
+        value = value + 1;
+
+        if (!accept_punct(",")) {
+            break;
+        }
+    }
+    expect_punct("}");
+    expect_punct(";");
 }
 
 /* 二元：都从子层拿左值，遇到对应的运算符就继续往上套 */
@@ -1668,18 +1858,19 @@ static node_t* parse_primary(void) {
     /* 标识符 */
     if (tok.kind == TK_IDENT) {
         char name[64];
-        int from_define;
+        int cval = 0;
+        int is_const;
 
         copy_str_local(name, tok.text, sizeof(name));
 
-        from_define = lookup_define(name);
+        is_const = lookup_define(name, &cval);
         lex_next();
 
-        /* 宏常量 */
-        if (from_define >= 0 && !is_punct("(")) {
+        /* 宏常量 / 枚举名（值可以是负数，见 lookup_define 的注释） */
+        if (is_const && !is_punct("(")) {
             node_t* n = node_new(ND_NUM);
 
-            n->num = from_define;
+            n->num = cval;
             return n;
         }
 
@@ -1857,6 +2048,16 @@ static struct sym* declare_symbol(const char* name, vtype_t t, int kind) {
 
     memset(s, 0, sizeof(*s));
     copy_str_local(s->name, name, sizeof(s->name));
+
+    /* 按值使用一个只做了前向声明的结构体：大小还是 0，静默放过去会生成
+     * 错代码（比如给它分配 0 字节栈空间），所以在这里拦下来。
+     * 指向它的指针没问题 —— 指针就是 4 字节，不需要知道结构体多大。 */
+    if (t.is_struct && t.ptr == 0 && structs[t.sidx].nfields == 0) {
+        fatal("struct '%s' is only declared, not defined yet "
+              "(use a pointer, or define it before using it by value)",
+              structs[t.sidx].name);
+    }
+
     s->kind   = kind;
     s->base   = t.base;
     s->ptr    = t.ptr;
@@ -1891,7 +2092,7 @@ static void parse_array_dims(vtype_t* t) {
     }
 }
 
-/* 一条声明：可能是结构体定义、全局变量、函数原型或函数定义。
+/* 一条声明：可能是结构体/枚举定义、全局变量、函数原型或函数定义。
  *
  * 变量声明返回一个 ND_DECL 的链（"int a = 1, b;" 是两个节点），
  * 函数原型和函数定义返回 NULL —— 它们不需要可执行代码。 */
@@ -1900,7 +2101,173 @@ static node_t* parse_declaration(int eat_semi) {
     char name[64];
     int is_global = parsing_global;
 
-    /* 先看是不是 "struct T { ... };" 这种定义。
+    /* typedef 定义：`typedef int MyInt;`、`typedef struct node Node;`、
+     * `typedef struct node { ... } Node;`。
+     * 它只往 typedef 表里登记一个名字，不产生任何代码。 */
+    if (is_kw("typedef")) {
+        vtype_t tt;
+
+        lex_next();
+
+        /* `typedef struct Name { ... } Alias;` —— 先把结构体定义吃掉。
+         *
+         * 这里必须自己把别名表列完，不能吃掉定义后再交给 parse_type()：
+         * parse_struct_def() 连结尾的 ';' 一起吃了，词法位置已经越过
+         * `struct Name`，parse_type() 只会看到别名（一个还不存在的
+         * typedef 名），于是报 "expected a type" —— 第一版就是这样，
+         * `typedef struct point { int x; } Point;` 根本编译不过。
+         *
+         * 顺带支持匿名的 `typedef struct { ... } Alias;`：没有名字就造一个
+         * 内部名字（$anonN），反正用户代码里也用不到它。 */
+        if (is_kw("struct")) {
+            const char* save_p    = lex_p;
+            token_t     save_tok  = tok;
+            int         save_line = src_line;
+            char        sname[32];
+            int         is_def    = 0;
+            int         have_st   = 0;
+
+            lex_next();
+            if (tok.kind == TK_IDENT) {
+                copy_str_local(sname, tok.text, sizeof(sname));
+                lex_next();
+                if (is_punct("{")) {
+                    is_def = 1;
+                }
+            } else if (is_punct("{")) {
+                /* 匿名结构体：造一个内部名字（这里没有 stdio，手写十进制） */
+                char* np = sname;
+                int   v  = ++anon_struct_n;
+
+                *np++ = '$';
+                *np++ = 'a';
+                *np++ = 'n';
+                *np++ = 'o';
+                *np++ = 'n';
+                if (v >= 10) {
+                    char digits[12];
+                    int  k = 0;
+
+                    while (v > 0) {
+                        digits[k++] = (char)('0' + v % 10);
+                        v /= 10;
+                    }
+                    while (k > 0) {
+                        *np++ = digits[--k];
+                    }
+                } else {
+                    *np++ = (char)('0' + v);
+                }
+                *np = '\0';
+                is_def = 1;
+            }
+            if (is_def) {
+                vtype_t st;
+
+                parse_struct_def(sname, 0);    /* 结尾的 ';' 不在这里 */
+                have_st = 1;
+
+                memset(&st, 0, sizeof(st));
+                st.is_struct = 1;
+                st.sidx      = find_struct(sname);
+                if (st.sidx < 0) {
+                    fatal("internal: struct '%s' just defined is missing", sname);
+                }
+
+                if (accept_punct(";")) {
+                    /* `typedef struct Name { ... };` —— 其实没有别名，
+                     * 等价于一条普通的结构体定义。 */
+                    return NULL;
+                }
+                for (;;) {
+                    vtype_t t2 = st;
+                    char    tname[32];
+
+                    expect_ident(tname, sizeof(tname));
+                    while (accept_punct("*")) {
+                        t2.ptr++;
+                    }
+                    if (is_punct("[")) {
+                        parse_array_dims(&t2);
+                    }
+                    add_typedef(tname, t2);
+                    if (!accept_punct(",")) {
+                        break;
+                    }
+                }
+                expect_punct(";");
+                return NULL;
+            }
+            if (!have_st) {
+                lex_p    = save_p;
+                tok      = save_tok;
+                src_line = save_line;
+            }
+        }
+
+        tt = parse_type();
+
+        {
+            int first_alias = 1;
+
+            for (;;) {
+                vtype_t t2 = tt;
+                char tname[32];
+
+                /* 逗号后面的声明符要自己带自己的 '*'：
+                 * `typedef int A, *B;` 里 B 是指针，而
+                 * `typedef int *A, B;` 里 B 只是 int —— 原来两处都错，
+                 * 因为 t2 每次都从 tt 原样复制（tt 带着第一个声明符的星号）。 */
+                if (!first_alias) {
+                    t2.ptr = 0;
+                }
+                while (accept_punct("*")) {
+                    t2.ptr++;
+                }
+                first_alias = 0;
+
+                expect_ident(tname, sizeof(tname));
+                if (is_punct("[")) {
+                    parse_array_dims(&t2);
+                }
+                add_typedef(tname, t2);
+
+                if (!accept_punct(",")) {
+                    break;
+                }
+            }
+        }
+        expect_punct(";");
+        return NULL;
+    }
+
+    /* 先看是不是 "enum Color { ... };" 这种定义（和下面的 struct 一样，
+     * 只看当前 token 分不清定义和 "enum Color c;"，要往后看一个）。 */
+    if (is_kw("enum")) {
+        const char* save_p    = lex_p;
+        token_t     save_tok  = tok;
+        int         save_line = src_line;
+        char        ename[32];
+        int         is_def    = 0;
+
+        lex_next();
+        if (tok.kind == TK_IDENT) {
+            copy_str_local(ename, tok.text, sizeof(ename));
+            lex_next();
+            if (is_punct("{")) {
+                is_def = 1;
+            }
+        }
+        if (is_def) {
+            parse_enum_def(ename);
+            return NULL;
+        }
+        lex_p    = save_p;
+        tok      = save_tok;
+        src_line = save_line;
+    }
+
+    /* 先看是不是 "struct T { ... };" 这种定义，或者 "struct T;" 前向声明。
      * 只看当前 token 分不清 "struct T {" 和 "struct T x;"，所以要往后看一个：
      * 词法器只有一个 token 的前看量，用"存下位置再退回来"的老办法。 */
     if (is_kw("struct")) {
@@ -1909,6 +2276,7 @@ static node_t* parse_declaration(int eat_semi) {
         int         save_line = src_line;
         char        sname[32];
         int         is_def    = 0;
+        int         is_fwd    = 0;
 
         lex_next();
         if (tok.kind == TK_IDENT) {
@@ -1916,10 +2284,17 @@ static node_t* parse_declaration(int eat_semi) {
             lex_next();
             if (is_punct("{")) {
                 is_def = 1;
+            } else if (is_punct(";")) {
+                is_fwd = 1;
             }
         }
         if (is_def) {
-            parse_struct_def(sname);       /* 吃掉 body 和结尾的 ';' */
+            parse_struct_def(sname, 1);    /* 吃掉 body 和结尾的 ';' */
+            return NULL;
+        }
+        if (is_fwd) {
+            lex_next();                    /* 吃掉 ';' */
+            declare_struct_forward(sname);
             return NULL;
         }
         lex_p    = save_p;
@@ -2149,6 +2524,15 @@ static node_t* parse_declaration(int eat_semi) {
             }
 
             if (accept_punct(",")) {
+                /* 逗号后面的声明符自己带自己的 '*'（parse_type 只吃掉了
+                 * 第一个声明符前面那批）：
+                 *   `int *a, b;`  b 是 int（原来被当成 int* 了）
+                 *   `int a, *b;`  b 是 int*（原来 `int a, *b;` 直接报错，
+                 *                 因为这里紧接着就 expect_ident） */
+                base.ptr = 0;
+                while (accept_punct("*")) {
+                    base.ptr++;
+                }
                 expect_ident(name, sizeof(name));
                 continue;
             }
@@ -2160,9 +2544,62 @@ static node_t* parse_declaration(int eat_semi) {
     }
 }
 
+/* case 的常量表达式。
+ *
+ * 支持：十进制/十六进制字面量、字符常量、常量表里的名字（enum 成员、
+ * #define），以及它们之间的一元 +- 和二元 +-。
+ * 不支持 '* / ( )' —— 那几个在 case 里本来就少见，宁可报错也别算错，
+ * 而"只认数字字面量"更糟：`case RED:` 这种写法直接编译不过。
+ */
+static int parse_case_const_term(void) {
+    int v = 0;
+    int neg = 0;
+
+    for (;;) {
+        if (accept_punct("-")) {
+            neg = !neg;
+        } else if (accept_punct("+")) {
+            /* 一元正号，没用 */
+        } else {
+            break;
+        }
+    }
+
+    if (tok.kind == TK_NUM || tok.kind == TK_CHARLIT) {
+        v = (int)tok.num;
+        lex_next();
+    } else if (tok.kind == TK_IDENT) {
+        if (!lookup_define(tok.text, &v)) {
+            fatal("'case' value '%s' is not a constant "
+                  "(enum member or #define)", tok.text);
+        }
+        lex_next();
+    } else {
+        fatal("'case' needs a constant value");
+    }
+    return neg ? -v : v;
+}
+
+static int parse_case_const(void) {
+    int v = parse_case_const_term();
+
+    for (;;) {
+        if (accept_punct("+")) {
+            v += parse_case_const_term();
+        } else if (accept_punct("-")) {
+            v -= parse_case_const_term();
+        } else {
+            break;
+        }
+    }
+    return v;
+}
+
 static node_t* parse_stmt(void) {
-    /* 声明 */
-    if (is_type_kw()) {
+    /* 声明。`typedef` 也走这一支：块里面的 typedef 只看 is_type_kw() 是
+     * 看不出来的（typedef 不是类型名），于是它会被当成表达式语句，
+     * 报"未声明的变量 typedef" —— 报错信息完全指不到点子上。 */
+    if (is_type_kw() || is_kw("typedef")) {
         return parse_declaration(1);
     }
     /* 复合语句 */
@@ -2252,6 +2689,50 @@ static node_t* parse_stmt(void) {
         return node_new(ND_CONTINUE);
     }
 
+    /* switch (expr) 语句体
+     *
+     * case / default 是"标签"，作为普通语句挂在语句链上（见下面那两个
+     * 分支），代码生成时先扫一遍链把标签都找出来。 */
+    if (accept_kw("switch")) {
+        node_t* n = node_new(ND_SWITCH);
+
+        expect_punct("(");
+        n->a = parse_expr();
+        expect_punct(")");
+        n->b = parse_stmt();
+        return n;
+    }
+
+    if (accept_kw("case")) {
+        node_t* n = node_new(ND_CASE);
+
+        n->label = -1;
+        n->num = parse_case_const();
+        expect_punct(":");
+        /* 标签后面跟着的语句挂到 next 上，这样标签就"混"在语句链里，
+         * 一个 switch 体扫一遍就能按顺序找到所有分支（也支持
+         * "case 1: case 2: stmt;" 这种连着写）。 */
+        n->b = parse_stmt();
+        if (n->b) {
+            n->next = n->b;
+        }
+        n->b = NULL;
+        return n;
+    }
+
+    if (accept_kw("default")) {
+        node_t* n = node_new(ND_DEFAULT);
+
+        n->label = -1;
+        expect_punct(":");
+        n->b = parse_stmt();
+        if (n->b) {
+            n->next = n->b;
+        }
+        n->b = NULL;
+        return n;
+    }
+
     /* 表达式语句 */
     {
         node_t* n = node_new(ND_EXPRSTMT);
@@ -2283,7 +2764,19 @@ static node_t* parse_block(void) {
         } else {
             head = s;
         }
+        /* 一个"语句"可能是一条链：`int a = 1, b = 2;` 返回的是两个 ND_DECL，
+         * case 标签也把后面那条语句挂在 next 上。tail 必须推进到链尾，
+         * 否则下一条语句会覆盖链中间 —— 那样 b 的初始化会被整条丢掉，
+         * 而且完全看不出来。
+         *
+         * 注意推进之后**不能**再写一句 `tail = s;`（顺序反了就等于
+         * 白推）。这个修复第一版就是被一句多余赋值抵消掉的：switch 的
+         * case 体、`int a=1, b=2` 的第二个声明符照样被丢，而且完全看
+         * 不出来 —— 少了一句代码，多了一次默认 0 的赋值。 */
         tail = s;
+        while (tail->next) {
+            tail = tail->next;
+        }
     }
     lex_next();
 
@@ -2665,15 +3158,21 @@ static void gen_call(node_t* n) {
         fatal("function '%s' is declared but never defined", n->name);
     }
 
-    /* 实参从右往左压栈 */
+    /* 实参从右往左压栈。
+     *
+     * MAX_CALL_ARGS 这个上限必须**报错**，不能悄悄截断：原来超过 16 个
+     * 实参时只压了 16 个，收尾却按 na 调整 esp —— 一次调用把栈指针拨到
+     * 半空，返回地址都错位了。 */
+    if (na > MAX_CALL_ARGS) {
+        fatal("too many arguments in the call to '%s' (%d > %d)",
+              n->name, na, MAX_CALL_ARGS);
+    }
     {
-        node_t* args[16];
+        node_t* args[MAX_CALL_ARGS];
         int k = 0;
 
         for (node_t* a = n->a; a; a = a->next) {
-            if (k < 16) {
-                args[k++] = a;
-            }
+            args[k++] = a;
         }
         for (int i = k - 1; i >= 0; i--) {
             gen_expr(args[i]);
@@ -2974,7 +3473,12 @@ static void gen_stmt(node_t* n) {
             int lend = new_label();
 
             if (n->a) {
-                gen_stmt(n->a);            /* 初始化（可能是声明） */
+                /* 初始化（可能是声明）。`for (int i = 0, j = 3; ...)` 的
+                 * 初始化是一条 ND_DECL 链：只生成链头的话，后面的名字虽然
+                 * 有栈槽（assign_locals 会发）却没有初始化代码 —— 值不确定。 */
+                for (node_t* in = n->a; in; in = in->next) {
+                    gen_stmt(in);
+                }
             }
             if (loop_depth >= 32) {
                 fatal("loops are nested too deeply");
@@ -3010,16 +3514,128 @@ static void gen_stmt(node_t* n) {
 
         case ND_BREAK:
             if (loop_depth == 0) {
-                fatal("'break' outside of a loop");
+                fatal("'break' outside of a loop or switch");
             }
             e_jmp(break_labels[loop_depth - 1]);
             return;
 
         case ND_CONTINUE:
-            if (loop_depth == 0) {
+            /* switch 也占一层（为了 break），但它不是循环：
+             * 它那层的 continue 目标被设成 -1，落到这里就是"continue
+             * 在 switch 里但外面没有循环"，那才是真的错。 */
+            if (loop_depth == 0 || continue_labels[loop_depth - 1] < 0) {
                 fatal("'continue' outside of a loop");
             }
             e_jmp(continue_labels[loop_depth - 1]);
+            return;
+
+        case ND_SWITCH: {
+            /* 布局：
+             *     <求值>                    eax = 待比较的值
+             *     push eax                  留在栈顶，比较时从 [esp] 取
+             *     cmp [esp], 值N / je 分支N  每个 case 一条
+             *     jmp <default 或 cleanup>  都没匹配
+             *   分支N: ...                  break 跳 cleanup
+             *   cleanup:
+             *     add esp, 4                丢掉临时值
+             *
+             * continue 的坑：switch 里面写 continue，必须先把栈顶那 4 字节
+             * 临时值弹掉再跳回外层循环，否则每转一圈漏 4 字节，循环几百次
+             * 就把栈写穿了。所以这一层的 continue 目标不是外层循环的
+             * 标签，而是一小段蹦床（trampoline）：
+             *     add esp, 4
+             *     jmp <外层 continue>
+             * 蹦床放在 cleanup 之后，用一条 jmp 跳过，保证不会被顺序执行到。
+             */
+            node_t* body;
+            node_t* s;
+            int cleanup = new_label();
+            int no_match = cleanup;
+            int outer_cont = (loop_depth > 0) ? continue_labels[loop_depth - 1] : -1;
+            int lcont = -1;
+
+            if (!n->b) {
+                fatal("internal: switch without a body");
+            }
+            body = (n->b->kind == ND_BLOCK) ? n->b->a : n->b;
+
+            /* 第一遍：给每个分支分配标签（-1 表示还没分配），
+             * 顺便查重复的 case 值和重复的 default —— 重复了就是死代码，
+             * 而且第一个分支永远匹配，写错的人自己看不出来。 */
+            for (s = body; s; s = s->next) {
+                if (s->kind == ND_CASE || s->kind == ND_DEFAULT) {
+                    for (node_t* p = body; p != s; p = p->next) {
+                        if (s->kind == ND_CASE && p->kind == ND_CASE &&
+                            p->num == s->num) {
+                            fatal("duplicate 'case %d'", s->num);
+                        }
+                        if (s->kind == ND_DEFAULT && p->kind == ND_DEFAULT) {
+                            fatal("duplicate 'default' in one switch");
+                        }
+                    }
+                    if (s->label < 0) {
+                        s->label = new_label();
+                    }
+                }
+            }
+            for (s = body; s; s = s->next) {
+                if (s->kind == ND_DEFAULT) {
+                    no_match = s->label;
+                }
+            }
+
+            gen_expr(n->a);
+            e_push(R_EAX);
+
+            for (s = body; s; s = s->next) {
+                if (s->kind == ND_CASE) {
+                    e_load_sp(R_EAX);
+                    e_mov_r_imm(R_ECX, (uint32_t)s->num);
+                    e_alu_rr(ALU_CMP, R_EAX, R_ECX);
+                    e_je(s->label);
+                }
+            }
+            e_jmp(no_match);
+
+            /* 语句体：遇到标签就落标签，其它照常生成 */
+            if (loop_depth >= 32) {
+                fatal("switch/loops are nested too deeply");
+            }
+            break_labels[loop_depth] = cleanup;
+            if (outer_cont >= 0) {
+                lcont = new_label();
+                continue_labels[loop_depth] = lcont;
+            } else {
+                continue_labels[loop_depth] = -1;
+            }
+            loop_depth++;
+
+            for (s = body; s; s = s->next) {
+                if (s->kind == ND_CASE || s->kind == ND_DEFAULT) {
+                    place_label(s->label);
+                    continue;
+                }
+                gen_stmt(s);
+            }
+
+            loop_depth--;
+            place_label(cleanup);
+            e_add_esp_imm(4);          /* 丢掉那个临时值 */
+            if (lcont >= 0) {
+                int lskip = new_label();
+
+                e_jmp(lskip);          /* 别顺序走进蹦床 */
+                place_label(lcont);
+                e_add_esp_imm(4);      /* 丢掉那个临时值 */
+                e_jmp(outer_cont);
+                place_label(lskip);
+            }
+            return;
+        }
+
+        case ND_CASE:
+        case ND_DEFAULT:
+            fatal("'case'/'default' must be at the top level of a switch body");
             return;
 
         default:
@@ -3064,13 +3680,29 @@ static void assign_locals(node_t* s, int* used) {
             case ND_DOWHILE:
                 assign_locals(s->b, used);
                 break;
+            case ND_SWITCH:
+                /* switch 也是"带子语句的语句"：漏掉这一支，写在 switch 体里的
+                 * 局部变量就永远没有栈槽（frame 算成 0），赋值会落到 [ebp+0]
+                 * 上，把调用者的 ebp 踩掉 —— 静默的错代码。 */
+                assign_locals(s->b, used);
+                break;
+            case ND_CASE:
+            case ND_DEFAULT:
+                /* case/default 后面挂的语句在 next 上，外层循环会走到；
+                 * 但它自己的 b（如果有）也要扫。 */
+                assign_locals(s->b, used);
+                break;
             case ND_FOR:
                 if (s->a && s->a->kind == ND_DECL) {
-                    int size = type_size(sym_vtype(s->a->sym));
+                    /* `for (int i = 0, j = 3; ...)` 是一条 ND_DECL 链，
+                     * 每个声明符都要槽位（原来只处理链头，j 就没槽了）。 */
+                    for (node_t* d = s->a; d; d = d->next) {
+                        int size = type_size(sym_vtype(d->sym));
 
-                    size = (size + 3) & ~3;
-                    *used += size;
-                    s->a->sym->offset = -*used;
+                        size = (size + 3) & ~3;
+                        *used += size;
+                        d->sym->offset = -*used;
+                    }
                 } else if (s->a) {
                     assign_locals(s->a, used);
                 }
@@ -3470,11 +4102,14 @@ static const char* RT_SOURCE =
     "    char buf[16];\n"
     "    int i = 0;\n"
     "    int u = v;\n"
+    "    int left = 0;\n"
+    "    if (u < 0) { left = 8; }\n"
     "    if (u == 0) { putchar('0'); return; }\n"
-    "    while (u > 0 && i < 15) {\n"
+    "    while (i < 15 && (u > 0 || left > 0)) {\n"
     "        buf[i] = rt_hexdigits[u & 15];\n"
     "        u = u >> 4;\n"
     "        i = i + 1;\n"
+    "        if (left > 0) { left = left - 1; }\n"
     "    }\n"
     "    while (i > 0) { i = i - 1; putchar(buf[i]); }\n"
     "}\n"
@@ -3501,6 +4136,60 @@ static const char* RT_SOURCE =
     "\n"
     "void free(void* p) {\n"
     "    p = p;\n"
+    "}\n"
+    "\n"
+    "/* ---- 字符串函数 ---- */\n"
+    "\n"
+    "char* strcat(char* d, char* s) {\n"
+    "    int i = strlen(d);\n"
+    "    int j = 0;\n"
+    "    while (s[j] != 0) { d[i] = s[j]; i = i + 1; j = j + 1; }\n"
+    "    d[i] = 0;\n"
+    "    return d;\n"
+    "}\n"
+    "\n"
+    "char* strchr(char* s, int c) {\n"
+    "    int i = 0;\n"
+    "    while (s[i] != 0) {\n"
+    "        if (s[i] == c) { return s + i; }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    if (c == 0) { return s + i; }\n"
+    "    return 0;\n"
+    "}\n"
+    "\n"
+    "char* strrchr(char* s, int c) {\n"
+    "    int i = 0;\n"
+    "    char* hit = 0;\n"
+    "    while (s[i] != 0) {\n"
+    "        if (s[i] == c) { hit = s + i; }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    if (c == 0) { return s + i; }\n"
+    "    return hit;\n"
+    "}\n"
+    "\n"
+    "char* strstr(char* hay, char* needle) {\n"
+    "    int i = 0;\n"
+    "    if (needle[0] == 0) { return hay; }\n"
+    "    while (hay[i] != 0) {\n"
+    "        int j = 0;\n"
+    "        while (needle[j] != 0 && hay[i + j] == needle[j]) { j = j + 1; }\n"
+    "        if (needle[j] == 0) { return hay + i; }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    return 0;\n"
+    "}\n"
+    "\n"
+    "int memcmp(void* a, void* b, int n) {\n"
+    "    char* x = (char*)a;\n"
+    "    char* y = (char*)b;\n"
+    "    int i = 0;\n"
+    "    while (i < n) {\n"
+    "        if (x[i] != y[i]) { return x[i] - y[i]; }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    return 0;\n"
     "}\n"
     "\n"
     "/* ---- 字符串与格式化输出 ---- */\n"
@@ -3815,6 +4504,13 @@ int main(void) {
     /* --- 编译 --- */
     init_labels();
     register_builtins();
+
+    /* 几个到处都在用的名字，直接当内建常量给出来。
+     * 用户的 #define 或变量会覆盖它们（常量表先于变量查找），
+     * 所以想用同名的变量就自己 #define 一下。 */
+    add_constant("NULL", 0);
+    add_constant("true", 1);
+    add_constant("false", 0);
 
     src_name = "<hncc runtime>";
     lex_p = RT_SOURCE;

@@ -615,8 +615,10 @@ if ($programs -and $programs.Count -gt 0) {
         }
     }
     if ($missing.Count -gt 0) {
-        Fail ("镜像的 HNeoFS 里找不到这些程序：{0}" -f ($missing -join ", ")) +
-             "`n         编译出来的 .lxe 没有进到镜像里（检查 fsroot/bin/ 和 mkfs 的 -SourceDir）。"
+        # 括号必须把两段都包进去：Fail 一旦执行就 exit 1，
+        # 写成 `Fail (...) + "..."` 的话后半句永远打不出来。
+        Fail ((("镜像的 HNeoFS 里找不到这些程序：{0}" -f ($missing -join ", ")) +
+               "`n         编译出来的 .lxe 没有进到镜像里（检查 fsroot/bin/ 和 mkfs 的 -SourceDir）。"))
     }
     Write-Ok "HNeoFS 超级块正常，$($programs.Count) 个用户程序都在镜像里（共 $sbCount 个目录项）"
 } else {
@@ -648,8 +650,12 @@ if ($pkgDirs.Count -gt 0) {
         $missingPkg += "index"
     }
     if ($missingPkg.Count -gt 0) {
-        Fail ("镜像的 HNeoFS 里找不到这些仓库文件：{0}" -f ($missingPkg -join ", ")) +
-             "`n         检查 fsroot\var\hpm\repo\ 和 mkfs 的 -SourceDir。"
+        # 整条消息要在 Fail 之前拼好：写成
+        #   Fail ("..." -f (...)) + "..."
+        # 的话，+ 后面那半截是**另一个**表达式，Fail 早就带着半句话 exit 了，
+        # 那半截永远不会打印出来。
+        Fail (("镜像的 HNeoFS 里找不到这些仓库文件：{0}" -f ($missingPkg -join ", ")) +
+              "`n         检查 fsroot\var\hpm\repo\ 和 mkfs 的 -SourceDir。")
     }
     Write-Ok "$($repoPkgs.Count) 个 .hnpkg 和索引都在镜像里（共 $sbCount 个目录项）"
 }

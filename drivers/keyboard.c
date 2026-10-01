@@ -8,6 +8,12 @@
 #define KEYBOARD_DATA_PORT   0x60
 #define KEYBOARD_STATUS_PORT 0x64
 
+/* 状态寄存器 bit0：输出缓冲区里有数据等着被读。
+ * 没有这一位还去读 0x60，读到的是**上一次那个字节** —— 伪中断（IRQ1
+ * 被无端拉起来一次）就变成"同一个字符进了两次"。回归里偶尔出现的
+ * `guest` 打成 `guuest` 就是这个：多出来的那个字符不是打错的。 */
+#define STATUS_OUTPUT_FULL 0x01
+
 /* 状态寄存器 bit5：数据来自辅助端口（鼠标）。
  * 键盘和鼠标共用 0x60，读到鼠标数据时必须留给 IRQ12 处理。 */
 #define STATUS_AUX_DATA 0x20
@@ -69,13 +75,24 @@ static void kbd_push(uint16_t c) {
 /* IRQ1 处理函数 */
 static void keyboard_callback(registers_t* regs) {
     uint8_t scancode;
+    uint8_t status;
     bool released;
     uint8_t code;
 
     (void)regs;
 
+    status = inb(KEYBOARD_STATUS_PORT);
+
+    /* 缓冲区是空的：这次中断没有新字节可读。此时读 0x60 只会把上一个
+     * 字节再读一遍（控制器会把最近一次的值留在那里），于是同一个字符
+     * 被送进输入缓冲区两次 —— 必须在这里就退出去。 */
+    if ((status & STATUS_OUTPUT_FULL) == 0) {
+        pic_send_eoi(1);
+        return;
+    }
+
     /* 如果这次是鼠标的数据，别碰它，留给 IRQ12 的处理器 */
-    if (inb(KEYBOARD_STATUS_PORT) & STATUS_AUX_DATA) {
+    if (status & STATUS_AUX_DATA) {
         pic_send_eoi(1);
         return;
     }

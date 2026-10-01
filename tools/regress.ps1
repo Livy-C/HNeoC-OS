@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 #  regress.ps1 - boot the VM once, drive it from the host, and
 #  assert on the serial console mirror.
 #
@@ -233,6 +233,38 @@ $checks = @(
        Expect = @("1 42", "2 hncc has 4", "3 xyz",
                   "4 ff -5 12", "5 1 2 3 4 5", "6 n=7%", "7 107") },
 
+    # enum (implicit and explicit values, negatives) and switch (fall-through,
+    # 'case 2: case 3:' label lists, default, break vs continue inside a loop),
+    # plus a multi-declarator local declaration followed by more statements.
+    @{ Name = "hncc compiles t5.c (enum/switch)"; Send = @("hncc /share/hncc/t5.c");
+       Expect = @("compiled /share/hncc/t5\.c") },
+
+    @{ Name = "hncc enum/switch output is correct"; Send = @("/share/hncc/t5.lxe");
+       Expect = @("1 0 1 2 3", "2 0 7 -3", "3 100 200 300 999",
+                  "4 14", "5 110", "6 27", "7 10000", "8 42",
+                  "9 -3", "10 2") },
+
+    # typedef (struct/int/pointer), a struct forward declaration so two structs
+    # can point at each other, the runtime string functions, and NULL.
+    @{ Name = "hncc compiles t6.c (typedef/strings)"; Send = @("hncc /share/hncc/t6.c");
+       Expect = @("compiled /share/hncc/t6\.c") },
+
+    @{ Name = "hncc typedef/strings output is correct"; Send = @("/share/hncc/t6.lxe");
+       Expect = @("1 42", "2 7", "3 42 8", "4 5",
+                  "5 abcdef 6", "6 1 0", "7 cdef 0", "8 0", "9 1") },
+
+    # Anonymous struct typedefs, declarator lists with pointers (`int a, *b;`
+    # / `int* c, d;`), typedef lists with pointers, a typedef inside a function
+    # body, and print_hex with a negative value.
+    @{ Name = "hncc compiles t7.c (typedef forms/declarators)";
+       Send = @("hncc /share/hncc/t7.c");
+       Expect = @("compiled /share/hncc/t7\.c") },
+
+    @{ Name = "hncc typedef/declarator output is correct";
+       Send = @("/share/hncc/t7.lxe");
+       Expect = @("1 11 22 8", "2 33 44", "3 7 6", "4 9",
+                  "5 8", "6 6", "7 ffffffff") },
+
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },
 
@@ -242,8 +274,11 @@ $checks = @(
     @{ Name = "guest cannot write /"; Send = @("mkdir /nope");
        Expect = @("mkdir: permission denied") },
 
+    # 期望里带上 `hneoc$guest` 这个提示符：只看 "mine" 的话，登录失败时
+    # 命令行会把 "mkdir mine" 回显出来，"mine" 照样能匹配上 —— 那是一条
+    # 假通过（真出过一次）。
     @{ Name = "guest can write its own dir"; Send = @("mkdir mine", "ls");
-       Expect = @("mine") },
+       Expect = @('hneoc\$guest', "mine") },
 
     @{ Name = "guest cannot install packages"; Send = @("hpm install docs");
        Expect = @("only an administrator can install packages") }

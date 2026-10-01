@@ -548,10 +548,11 @@ counter after the loop:
 
 | 支持 | 说明 |
 |------|------|
-| 类型 | `int` `char` `void`、指针、数组、`struct`；`static` `const` `unsigned` `signed` `long` `short` 都接受（见下） |
-| 语句 | 声明（可带初值）、`if/else`、`while`、`do-while`、`for`、`return`、`break`、`continue` |
-| 运算 | `+ - * / %`、比较、`&& ||`（短路）、`! ~ & \| ^ << >>`、`++ --`、赋值与复合赋值、`? :`、`[]`、`()`、`&` `*`、`sizeof`、强制类型转换 |
-| 结构体 | `struct T { ... };` 定义、`a.f`、`p->f`（可以串起来：`p->next->value`）、结构体数组、`sizeof(struct T)` |
+| 类型 | `int` `char` `void`、指针、数组、`struct`、`enum`、`typedef`；`static` `const` `unsigned` `signed` `long` `short` 都接受（见下） |
+| 语句 | 声明（可带初值，`int a = 1, *b;` 这样一串也行）、`if/else`、`while`、`do-while`、`for`、`switch/case/default`、`return`、`break`、`continue` |
+| 运算 | `+ - * / %`、比较、`&& \|\|`（短路）、`! ~ & \| ^ << >>`、`++ --`、赋值与复合赋值、`? :`、`[]`、`()`、`&` `*`、`sizeof`、强制类型转换 |
+| 结构体 | `struct T { ... };` 定义、前向声明（`struct T;`，于是两个结构体能互相指）、`a.f`、`p->f`（可以串起来：`p->next->value`）、结构体数组、`sizeof(struct T)`、`typedef struct T { ... } Alias;` 和匿名的 `typedef struct { ... } Alias;` |
+| 枚举与分支 | `enum Color { RED, GREEN = 7, FAIL = -3 };`（枚举名就是常量）、`switch`/`case`/`default`（含 `case 2: case 3:` 连着写、fall-through、`break` 只跳 `switch`、`continue` 跳外层循环）；`case` 的值可以是枚举名/`#define` 常量和它们的 `+` `-` |
 | 初始化 | `int a[4] = {1,2,3,4};`（全局和局部都行，没写到的位置留 0）、`char s[] = "abc";`、`int a[] = {1,2,3};`（长度自动推断） |
 | 变参 | `printf(fmt, ...)`；自己写带 `...` 的函数也行 —— 参数从右往左压栈，所以第一个参数在最低地址，往后数就是可变参数 |
 | 其它 | 函数（递归、前置声明）、全局变量、字符串/字符字面量、注释、`#define` 常量（只认 `#define 名字 十进制数字` 这一种写法，别的一律静默忽略；常量表上限 64 条，和其它常量共用一张表）、`#include` 直接忽略 |
@@ -566,7 +567,9 @@ counter after the loop:
 
 不支持：浮点、`long long`（当 `int` 处理）、真正的预处理器、多文件编译、
 初始化列表里的嵌套（`int m[2][2] = {{1,2},{3,4}}`）和结构体元素
-（逐字段赋值代替）。
+（逐字段赋值代替）。另外两条容易踩的：局部变量**不能**和 `typedef` 名重名
+（`typedef int T;` 之后再写 `int T;`，那个位置会被当成类型名）；
+调用实参最多 16 个（超过会明确报错，不会默默截断）。
 
 结构体的三条限制（都是**明确报错**，不会默默生成坏代码）：
 - 结构体只能通过**指针**传递和返回，不能按值传（`int f(struct T x)` 会被拒绝：
@@ -582,17 +585,26 @@ counter after the loop:
 **直接发射 `int 0x80`**，所以用户程序不需要 `#include`，也不需要链接任何库。
 
 **运行时是"自己编译自己"**：编译器内部带着一段用这个 C 子集写的源码
-（`strlen` `strcmp` `strcpy` `memset` `memcpy` `atoi` `puts` `putstr`
-`print_int` `print_uint` `print_hex` `printf` `malloc` `free`），每次编译用户
+（`strlen` `strcmp` `strcpy` `strcat` `strchr` `strrchr` `strstr` `memcmp`
+`memset` `memcpy` `atoi` `puts` `putstr` `print_int` `print_uint` `print_hex`
+`printf` `malloc` `free`），每次编译用户
 代码之前先把它编译一遍 —— 既是标准库，也是每次编译都在跑的自测。
 `printf` 本身就是一个变参函数，用的是它自己那套"从栈上往后数参数"的技巧。
 
-`/share/hncc/` 下有六个例子：`hello.c`、`fib.c`（递归 + 数组 + 指针）、
+`/share/hncc/` 下有八个例子：`hello.c`、`fib.c`（递归 + 数组 + 指针）、
 `t1.c`（八项数字诊断）、`t2.c`（结构体九项数字诊断：局部结构体、指针、
 `->` 链、结构体数组、`sizeof`、结构体指针传参）、
 `t3.c`（初始化列表与修饰词八项数字诊断：全局/局部数组、长度推断、
 字符串初始化、`sizeof`、`const`/`long`/`unsigned`）、
-`t4.c`（`printf` 格式化七项诊断：`%d %u %x %c %s %%` 混用）。
+`t4.c`（`printf` 格式化七项诊断：`%d %u %x %c %s %%` 混用）、
+`t5.c`（`enum`/`switch` 十项诊断：隐式与显式枚举值、
+`case 2: case 3:`、fall-through、`switch` 里的 `break`/`continue`、
+`switch` 体里的局部变量、`case` 用枚举常量）、
+`t6.c`（`typedef`/字符串九项诊断：结构体 typedef、前向声明互指、
+`strchr`/`strstr`/`memcmp`/`NULL`）、
+`t7.c`（`typedef` 写法与声明符七项诊断：匿名结构体 typedef、
+`int a = 1, *b;`、`int* c, d;`、`typedef int A, *B;`、函数体里的 typedef、
+`%x` 打负数）。
 
 ---
 
@@ -817,7 +829,7 @@ hneoc-os/
 启动横幅与堆范围、512KB 的 bss、超大镜像被加载器拒绝、长 I/O 期间时钟、
 系统调用边界、用户态异常只杀进程、vi 打开与退出、hpm 的装依赖/运行装出来的
 程序/列文件/校验/卸载、hncc 的编译与产物输出（基础八项、结构体、初始化列表、
-`printf` 四组数字诊断），
+`printf`、`enum`/`switch`、`typedef`/字符串、`typedef` 写法与声明符 七组数字诊断），
 以及账户权限（guest 不能写 `/`、不能装包，但能在自己目录里建目录）。
 
 新加功能时顺手往 `$checks` 里加一条，比手敲一遍可靠得多。
