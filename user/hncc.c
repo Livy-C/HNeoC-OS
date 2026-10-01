@@ -1010,6 +1010,7 @@ struct sym_func {
     int  is_builtin;       /* 内建函数：编译器直接发射系统调用，没有函数体 */
     int  builtin_nr;       /* 内建函数对应的系统调用号；-1 表示特殊处理 */
     int  builtin_mode;     /* 0 普通，1 = putchar 那种特殊形式，2 = 之后要 hlt */
+    int  is_varargs;       /* 参数表里有 "..."：调用时不再核对参数个数 */
     struct sym* param_sym[8];  /* 形参在局部表里的符号（代码生成时给它们定偏移） */
 };
 
@@ -1720,7 +1721,13 @@ static node_t* parse_primary(void) {
 
             if (fi >= 0) {
                 n->ty = funcs[fi].ret;
-                if (count_args(n->a) != funcs[fi].nparams) {
+                if (funcs[fi].is_varargs) {
+                    /* 变参函数只要求"至少给够固定参数" */
+                    if (count_args(n->a) < funcs[fi].nparams) {
+                        fatal("'%s' needs at least %d argument(s) but got %d",
+                              name, funcs[fi].nparams, count_args(n->a));
+                    }
+                } else if (count_args(n->a) != funcs[fi].nparams) {
                     fatal("'%s' expects %d argument(s) but got %d", name,
                           funcs[fi].nparams, count_args(n->a));
                 }
@@ -1994,9 +2001,18 @@ static node_t* parse_declaration(int eat_semi) {
 
             if (!no_params) {
                 for (;;) {
-                    vtype_t pt = parse_type();
+                    vtype_t pt;
                     char pn[32];
 
+                    /* "..." 结束固定参数，之后是可变参数。
+                     * 有它之后调用点不再核对参数个数（见 parse_primary）。 */
+                    if (is_punct("...")) {
+                        lex_next();
+                        f->is_varargs = 1;
+                        break;
+                    }
+
+                    pt = parse_type();
                     expect_ident(pn, sizeof(pn));
                     if (is_punct("[")) {
                         parse_array_dims(&pt);
@@ -3485,6 +3501,60 @@ static const char* RT_SOURCE =
     "\n"
     "void free(void* p) {\n"
     "    p = p;\n"
+    "}\n"
+    "\n"
+    "/* ---- 字符串与格式化输出 ---- */\n"
+    "\n"
+    "void putstr(char* s) {\n"
+    "    int i = 0;\n"
+    "    while (s[i] != 0) { putchar(s[i]); i = i + 1; }\n"
+    "}\n"
+    "\n"
+    "void print_uint(int v) {\n"
+    "    char buf[16];\n"
+    "    int i = 0;\n"
+    "    if (v < 0) { print_int(v); return; }\n"
+    "    if (v == 0) { putchar('0'); return; }\n"
+    "    while (v > 0 && i < 15) {\n"
+    "        buf[i] = (char)('0' + v % 10);\n"
+    "        i = i + 1;\n"
+    "        v = v / 10;\n"
+    "    }\n"
+    "    while (i > 0) { i = i - 1; putchar(buf[i]); }\n"
+    "}\n"
+    "\n"
+    "/* printf：变参是靠从参数在栈上的位置往后数实现的（不能直接写引号，\n"
+    " * 这是嵌在 C 字符串里的源码）。\n"
+    " * 调用约定是参数从右往左压栈，所以第一个参数在最低地址，\n"
+    " * 紧跟其后的字就是第一个可变参数 —— 和 user/lib 里那套是同一个技巧，\n"
+    " * 只不过这里是用 hncc 自己编译出来的代码。\n"
+    " * 支持 %d %u %x %c %s %%，返回值恒为 0（不统计字符数）。\n"
+    " */\n"
+    "int printf(char* fmt, ...) {\n"
+    "    int* args;\n"
+    "    int i = 0;\n"
+    "\n"
+    "    args = &fmt;\n"
+    "    args = args + 1;\n"
+    "\n"
+    "    while (fmt[i] != 0) {\n"
+    "        if (fmt[i] != '%') {\n"
+    "            putchar(fmt[i]);\n"
+    "            i = i + 1;\n"
+    "            continue;\n"
+    "        }\n"
+    "        i = i + 1;\n"
+    "        if (fmt[i] == 'd') { print_int(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'u') { print_uint(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'x') { print_hex(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'c') { putchar(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 's') { putstr((char*)*args); args = args + 1; }\n"
+    "        else if (fmt[i] == '%') { putchar('%'); }\n"
+    "        else if (fmt[i] == 0) { break; }\n"
+    "        else { putchar('%'); putchar(fmt[i]); }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    return 0;\n"
     "}\n";
 
 /* ============================================================

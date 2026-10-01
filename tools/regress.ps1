@@ -224,6 +224,15 @@ $checks = @(
        Expect = @("1 1234", "2 hncc", "3 12", "4 30",
                   "5 ac", "6 5008", "7 xyz", "8 109") },
 
+    # Variadic functions: printf lives in hncc's own runtime and pulls its
+    # arguments off the stack, so this also tests user-defined varargs.
+    @{ Name = "hncc compiles t4.c (printf)"; Send = @("hncc /share/hncc/t4.c");
+       Expect = @("compiled /share/hncc/t4\.c") },
+
+    @{ Name = "hncc printf output is correct"; Send = @("/share/hncc/t4.lxe");
+       Expect = @("1 42", "2 hncc has 4", "3 xyz",
+                  "4 ff -5 12", "5 1 2 3 4 5", "6 n=7%", "7 107") },
+
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },
 

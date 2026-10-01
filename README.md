@@ -548,6 +548,7 @@ counter after the loop:
 | 运算 | `+ - * / %`、比较、`&& ||`（短路）、`! ~ & \| ^ << >>`、`++ --`、赋值与复合赋值、`? :`、`[]`、`()`、`&` `*`、`sizeof`、强制类型转换 |
 | 结构体 | `struct T { ... };` 定义、`a.f`、`p->f`（可以串起来：`p->next->value`）、结构体数组、`sizeof(struct T)` |
 | 初始化 | `int a[4] = {1,2,3,4};`（全局和局部都行，没写到的位置留 0）、`char s[] = "abc";`、`int a[] = {1,2,3};`（长度自动推断） |
+| 变参 | `printf(fmt, ...)`；自己写带 `...` 的函数也行 —— 参数从右往左压栈，所以第一个参数在最低地址，往后数就是可变参数 |
 | 其它 | 函数（递归、前置声明）、全局变量、字符串/字符字面量、注释、`#define` 简单常量、`#include` 直接忽略 |
 
 结构体的字段按 4 字节对齐（每个字段、以及结构体整体），偏移在定义时算好。
@@ -576,15 +577,18 @@ counter after the loop:
 **直接发射 `int 0x80`**，所以用户程序不需要 `#include`，也不需要链接任何库。
 
 **运行时是"自己编译自己"**：编译器内部带着一段用这个 C 子集写的源码
-（`strlen` `strcmp` `strcpy` `memset` `memcpy` `atoi` `puts` `print_int`
-`print_hex` `malloc` `free`），每次编译用户代码之前先把它编译一遍 ——
-既是标准库，也是每次编译都在跑的自测。
+（`strlen` `strcmp` `strcpy` `memset` `memcpy` `atoi` `puts` `putstr`
+`print_int` `print_uint` `print_hex` `printf` `malloc` `free`），每次编译用户
+代码之前先把它编译一遍 —— 既是标准库，也是每次编译都在跑的自测。
+`printf` 本身就是一个变参函数，用的是它自己那套"从栈上往后数参数"的技巧。
 
 `/share/hncc/` 下有五个例子：`hello.c`、`fib.c`（递归 + 数组 + 指针）、
 `t1.c`（八项数字诊断）、`t2.c`（结构体九项数字诊断：局部结构体、指针、
 `->` 链、结构体数组、`sizeof`、结构体指针传参）、
 `t3.c`（初始化列表与修饰词八项数字诊断：全局/局部数组、长度推断、
-字符串初始化、`sizeof`、`const`/`long`/`unsigned`）。
+字符串初始化、`sizeof`、`const`/`long`/`unsigned`）、
+`t4.c`（变参与 `printf` 七项诊断：`%d %u %x %c %s %%` 混用、
+自己写的变参函数）。
 
 ---
 
