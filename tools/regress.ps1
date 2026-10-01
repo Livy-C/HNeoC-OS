@@ -199,8 +199,12 @@ $checks = @(
        Expect = @("1 65 66", "2 LITERAL-OK", "3 10", "4 7",
                   "5 67", "6 87 90", "7 16", "8 1") },
 
+    # 只发射用得到的运行时函数之后，hello.c 的代码区从一万多字节掉到
+    # 一千五百左右。这里的 `\d{1,4}` 必须紧跟 `bytes`，所以五位数字
+    # （旧的 10382）匹配不上 —— 死代码消除要是被改回去，这条会红。
     @{ Name = "hncc compiles hello.c"; Send = @("hncc /share/hncc/hello.c");
-       Expect = @("compiled /share/hncc/hello\.c") },
+       Expect = @("compiled /share/hncc/hello\.c",
+                  "code\s+:\s+\d{1,4}\s+bytes") },
 
     @{ Name = "hncc hello runs";  Send = @("/share/hncc/hello.lxe");
        Expect = @("compiled on HNeoC", "counter after the loop") },

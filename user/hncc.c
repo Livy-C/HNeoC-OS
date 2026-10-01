@@ -1132,6 +1132,8 @@ struct sym_func {
     int  builtin_nr;       /* 内建函数对应的系统调用号；-1 表示特殊处理 */
     int  builtin_mode;     /* 0 普通，1 = putchar 那种特殊形式，2 = 之后要 hlt */
     int  is_varargs;       /* 参数表里有 "..."：调用时不再核对参数个数 */
+    int  needed;           /* 有人调用了它（从 main 出发能到） */
+    int  emitted;          /* 已经生成过代码，不要再生成一遍 */
     struct sym* param_sym[8];  /* 形参在局部表里的符号（代码生成时给它们定偏移） */
 };
 
@@ -3158,6 +3160,10 @@ static void gen_call(node_t* n) {
         fatal("function '%s' is declared but never defined", n->name);
     }
 
+    /* 标记"这个函数要用"：真正发射哪些函数的代码是靠这个从 main
+     * 往外扩散算出来的（见 main 里的那个不动点循环）。 */
+    f->needed = 1;
+
     /* 实参从右往左压栈。
      *
      * MAX_CALL_ARGS 这个上限必须**报错**，不能悄悄截断：原来超过 16 个
@@ -4295,6 +4301,7 @@ static void emit_entry_stub(void) {
     if (funcs[main_fi].label < 0) {
         funcs[main_fi].label = new_label();
     }
+    funcs[main_fi].needed = 1;             /* 可达性从这里开始扩散 */
 
     e_call_label(funcs[main_fi].label);    /* E8 rel32 */
     e_mov_rr(R_EBX, R_EAX);                /* 89 C3 */
@@ -4532,8 +4539,33 @@ int main(void) {
         }
     }
     emit_entry_stub();
-    for (int fi = 0; fi < func_n; fi++) {
-        gen_function(fi);
+
+    /* 只发射用得到的函数。
+     *
+     * 做法是"从 main 往外扩散"：先把 main 标成 needed，然后一轮一轮地
+     * 生成 needed 但还没生成过的函数；gen_call 每遇到一次调用就把被调用
+     * 者标成 needed。直到某一轮什么都没新增为止。
+     *
+     * 顺序无所谓：调用和跳转都是按标签回填的（先发射 callee 还是 caller
+     * 都行），所以一个简单的多轮扫描就够了，不需要拓扑排序。
+     *
+     * 为什么要做：运行时是一整段 C 源码，里面 printf/malloc/strstr……
+     * 全都在。不筛选的话，一个只打一行字的程序也要背 10KB 的运行时 ——
+     * 而 hncc 自己的映像已经 55KB，离 60KB 的加载上限只差 5KB。
+     */
+    for (;;) {
+        int progress = 0;
+
+        for (int fi = 0; fi < func_n; fi++) {
+            if (funcs[fi].body && funcs[fi].needed && !funcs[fi].emitted) {
+                funcs[fi].emitted = 1;
+                gen_function(fi);
+                progress = 1;
+            }
+        }
+        if (!progress) {
+            break;
+        }
     }
 
     /* 代码生成完了，不允许还有没回填的跳转/调用。
