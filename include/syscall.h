@@ -10,8 +10,10 @@
  * 用户程序用 int 0x80 陷入内核，调用号放在 EAX，参数依次放在
  * EBX、ECX、EDX、ESI、EDI，返回值通过 EAX 带回。
  *
- * 之所以用 trap gate 而不是 interrupt gate：trap gate 不会清 IF，
- * 系统调用执行期间时钟和键盘中断照常到达，getchar 才能阻塞等待。
+ * 门是 interrupt gate + DPL=3（kernel/syscall.c 注册的是 0xEE）：DPL=3 让
+ * ring 3 能执行 int 0x80；interrupt gate 进门时会清 IF，这样系统调用返回
+ * 路径上的 sched_tick 不会被时钟中断嵌套重入。需要阻塞等待的系统调用
+ * （getchar / sleep）自己临时开中断。
  * ============================================================ */
 
 #define SYS_EXIT      0    /* exit(code) */

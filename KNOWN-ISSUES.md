@@ -30,10 +30,13 @@ static char buf[512 * 1024];      /* 512KB */
 int main(void) { puts("huge"); return 0; }
 ```
 
-注意：`user/user.ld` **没有 `.bss` 输出段**，所以静态数组会变成零填充的
-`.data`，被实体化进二进制 —— `huge.lxe` 会变成约 527KB（用 `objdump -h` 看得很清楚）。
-这也解释了为什么每个 `.lxe` 的 `bss_size` 都是 0：那条"bss 由加载器清零"的
-机制实际上从未生效。**给 `user.ld` 补上 `.bss` 段**本身就是一件该做的事。
+**（以下是当时的判断，已被紧接着的「2026 更新」推翻，保留作记录）**
+当时认为：`user/user.ld` **没有 `.bss` 输出段**，所以静态数组都会变成零填充的
+`.data` 被实体化进二进制 —— `huge.lxe` 当时有约 527KB（用 `objdump -h` 看得很清楚）。
+当时这也是"每个 `.lxe` 的 `bss_size` 都是 0"的解释：那条"bss 由加载器清零"的
+机制看起来从未生效。于是当时的结论是：**给 `user.ld` 补上 `.bss` 段**本身就是
+一件该做的事。后来发现 `user/user.ld` 一直是有 `.bss` 段的，真正的原因在
+`-fdata-sections`（见下），现在镜像里的 `bss_size` 是非 0 的。
 
 > **2026 更新：查掉了一半，而且修掉了一个真 bug**
 >
@@ -85,7 +88,8 @@ int main(void) { puts("huge"); return 0; }
 > 错误码 `-6`，Shell 打印 `program image is too large to load`。
 > `user/toobig.c`（64KB 有初值数组，约 65KB 镜像）专门验证这条护栏，
 > `tools/regress.ps1` 里有一条检查盯着它。
-> 自带程序里最大的是 `hncc.lxe`（40KB），不受影响。
+> 自带程序里最大的镜像是故意超限的 `toobig.lxe`（约 65KB），它就是为这条护栏
+准备的对照；正常程序里最大的是 `hncc.lxe`（48KB），不受影响。
 > 缺陷修好之后，把这个宏、`toobig.c` 和那条检查一起删掉即可。
 >
 > **(6) 下一步该做的实验**：
@@ -115,8 +119,11 @@ int main(void) { puts("huge"); return 0; }
 - **堆是健康的**：在分配前、分配后、读完之后、建栈之后、构造结束前五个点
   都跑了链表不变式检查（magic / next->prev / 块范围 / 不重叠）+ 统计，
   全部正常（4MB、used/free 数值正确、块数 1→2→3）。
-- **页目录和 PMM 位图没有重叠**（`nm` 实测）：`pd_storage` 0x23FC0–0x25FBF、
-  活动页目录 0x24000–0x24FFF、`frame_bitmap` 0x25FE0–0x45FDF，紧凑但不相交。
+- **页目录和 PMM 位图没有重叠**：这是那次排查时 `nm` 实测的地址 ——
+  `pd_storage` 0x23FC0–0x25FBF、活动页目录 0x24000–0x24FFF、
+  `frame_bitmap` 0x25FE0–0x45FDF，紧凑但不相交（内核后来一直在改，地址已经
+  前移；现在 `nm build/kernel.pe` 给的是 `pd_storage` 0x26D60、
+  `frame_bitmap` 0x28D80，同样不相交）。
 - `pmm_alloc_pages` / `ata_read_sectors` / `read_sector_words` / `lib/string.c` 的
   `memcpy` 都逐行看过，边界和步长全对。
 - 内核栈用水位线测过：每个任务用量都 **< 3000 / 8192** 字节，不存在栈溢出踩堆块头。
@@ -143,7 +150,7 @@ A6 竞态是根因（对照实验：只把内核栈泄漏改回旧行为、A6 �
 
 ## 2. 内核栈没有保护页（已加守卫，但结构问题还在）
 
-内核 BSS 结束在 `bss_end ≈ 0x63460`，Shell 用的是 `0x90000` 那块引导栈，
+内核 BSS 结束在 `bss_end ≈ 0x67380`，Shell 用的是 `0x90000` 那块引导栈，
 中间**不到 200KB**，而且没有任何保护页。一旦某条调用链吃超了，栈会静默穿过
 BSS、内核映像、`pd_storage`，最后压在页目录上 —— 直接就是上面那个三重故障。
 
@@ -169,8 +176,8 @@ panic，并把入口名、当时 esp、返回地址打出来。
 | `hneoc.h` 里有坏字符 | `user/lib/include/hneoc.h` | 早先一次编辑把 24 个多字节汉字截断成了 U+FFFD，只在注释里，不影响编译 |
 | 口令哈希不是安全 | `kernel/user.c` | djb2 无盐、算法公开，能写 `/etc/passwd` 就能加账户；只做到"明文不落盘" |
 | `/home` 是 0777 | `tools/mkfs.ps1` | 没有用户组、也没有"每个用户一个私有目录"的机制，只好让所有用户都能在 `/home` 下建目录 |
-| hncc 只支持 C 子集 | `user/hncc.c` | 没有结构体/浮点/变参/真前处理/多文件；数组初始化列表也不支持 |
+| hncc 只支持 C 子集 | `user/hncc.c` | 还缺：浮点、真正的预处理器、多文件编译，以及初始化列表里的嵌套数组和结构体元素（结构体、变参 / `printf`、初始化列表、`static` 等修饰词都已实现，并有回归检查覆盖） |
 | hncc 总是把整个运行时编进去 | `user/hncc.c` | 没做"只发射用到的函数"，小程序的产物也有几 KB 是运行时 |
 | hpm 不做版本升级 | `user/hpm.c` | `install` 只判断"装没装过"，不比较版本；也没有 `upgrade` |
 | hpm 卸载后留下空目录 | `user/hpm.c` | 只删文件、不删目录（没有 rmdir），会在屏幕上直说 |
-| 文档过期 | `README.md` | 魔数写成 `'LVSF'`（实际 `'HNFS'`，而且 `fsstat` 也跟着打错）、文件表 4 扇区/32 项（实际 8 扇区/64 项）、数据区 LBA 2053（实际 2057）、陷阱 #23 说反了 |
+| `fsstat` 打出错的魔数 | `kernel/shell.c` | 那行说明是硬写的 `('LVSF')`，实际魔数是 `'HNFS'`（`README.md` 里同类的过期数字已经改正） |

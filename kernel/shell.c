@@ -1298,7 +1298,7 @@ static void cmd_fsstat(void) {
     vga_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     vga_write("  magic        : ");
     vga_write_hex(sb->magic);
-    vga_writeln("  ('LVSF')");
+    vga_writeln("  ('HNFS')");
 
     vga_write("  version      : ");
     vga_write_uint(sb->version);
