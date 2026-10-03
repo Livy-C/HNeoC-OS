@@ -146,15 +146,25 @@ $checks = @(
                   "the 512KB array works") },
 
     # KNOWN-ISSUES #1: an image past 64KB used to triple-fault the VM while
-    # the loader read it into a kmalloc'd buffer. The loader now stages into
-    # a static BSS buffer, so a ~65KB image loads and runs for real.
+    # the loader read it into a kmalloc'd buffer. The loader now reads the
+    # image in page-sized chunks straight into the process's page frames, so
+    # there is no staging buffer at all.
     @{ Name = "a 65KB image loads and runs"; Send = @("toobig");
        Expect = @("an oversized program image",
                   "toobig: if you can read this") },
 
-    # ... and an image past the staging buffer (80KB) is still refused with
-    # a plain error instead of a crash.
-    @{ Name = "image past the staging buffer is refused";
+    # The original extreme reproducer (a 512KB *initialised* array, so the
+    # .lxe is 526KB) now loads and runs too. The checksum pins down that the
+    # whole body really arrived: all 512 sampled bytes are 0 except buf[0].
+    @{ Name = "a 526KB image loads and runs"; Send = @("bigdata");
+       Expect = @("bigdata: a 512KB \*initialised\* array",
+                  "the first few bytes are initialised",
+                  "checksum : 116",
+                  "the big .data image works") },
+
+    # ... and an image past PROCESS_MAX_LOAD_BYTES (1MB) is still refused
+    # with a plain error instead of a crash.
+    @{ Name = "image past the load limit is refused";
        Send = @("waytoobig");
        Expect = @("program image is too large to load") },
 

@@ -229,39 +229,39 @@ static uint32_t craft_initial_stack(process_t* p, uint32_t entry, uint32_t user_
     return (uint32_t)sp;
 }
 
-/* ------------------------------------------------------------
- * 从一个 LXE 映像创建进程
+/* 建进程的过程中出错：把已经拿到的资源还回去，槽位标回空闲。
+ * 以前这段清理在 create_from_image_locked 里重复了六遍，加一个"读正文
+ * 失败"的出口之后就更多了，所以收成一个函数。 */
+static void fail_create(process_t* p) {
+    free_user_resources(p);
+    if (p->kernel_stack) {
+        kfree(p->kernel_stack);
+        p->kernel_stack = NULL;
+    }
+    p->kernel_stack_top  = 0;
+    p->kernel_stack_size = 0;
+    p->state = PROC_UNUSED;
+}
+
+/* 按 LXE 头建进程骨架：页框、页表、内核栈、初始现场。
  *
- * 注意：这个函数会在任务还没构造完时就把它标成 READY，而此刻
- * esp / 页目录 / 页表可能还是空的。如果这段时间来了时钟中断，
- * 调度器就会切进一个半成品任务（esp = 0）直接崩掉。
- * 所以真正的构造过程全部在关中断状态下进行，外面套一层包装。
- * 构造期间没有磁盘 I/O，关闭时间很短。
- * ------------------------------------------------------------ */
-static process_t* create_from_image_locked(const char* filename, const uint8_t* image,
-                                           uint32_t size) {
-    const lxe_header_t* hdr;
+ * **这里不再拷贝映像正文** —— 正文由 fill_image_pages 直接读进页框。
+ * 这一条是照着 KNOWN-ISSUES 第 1 节改的：那个缺陷出在"拿 kmalloc 的一大块
+ * 内存当读盘目的地"上，所以加载路径上现在**不存在**任何"整份镜像"的缓冲区。
+ *
+ * 返回时任务的 state 已经是 PROC_READY（槽位不会再被别人抢走），但正文还
+ * 没读进来，所以调用方必须用 sched_lock 挡住任务切换，见 load_program。
+ */
+static process_t* create_from_header_locked(const char* filename,
+                                            const lxe_header_t* hdr,
+                                            int* err) {
     process_t* p;
     uint32_t need_pages;
     uint32_t vaddr;
 
-    if (size < LXE_HEADER_SIZE) {
-        return NULL;
-    }
-
-    hdr = (const lxe_header_t*)image;
-    if (hdr->magic != LXE_MAGIC || hdr->version != LXE_VERSION) {
-        return NULL;
-    }
-    if (hdr->size == 0 || LXE_HEADER_SIZE + hdr->size > size) {
-        return NULL;
-    }
-    if (hdr->entry >= hdr->size) {
-        return NULL;
-    }
-
     p = alloc_slot();
     if (!p) {
+        *err = -5;                     /* 进程表满了 */
         return NULL;
     }
 
@@ -304,6 +304,7 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
     p->kernel_stack = (uint8_t*)kmalloc(PROCESS_KERNEL_STACK_SIZE);
     if (!p->kernel_stack) {
         p->state = PROC_UNUSED;
+        *err = -3;
         return NULL;
     }
     memset(p->kernel_stack, 0, PROCESS_KERNEL_STACK_SIZE);
@@ -314,20 +315,18 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
     p->page_directory = (uint32_t)paging_create_directory();
     p->user_table     = paging_create_user_table();
     if (!p->page_directory || !p->user_table) {
-        free_user_resources(p);
-        kfree(p->kernel_stack);
-        p->state = PROC_UNUSED;
+        fail_create(p);
+        *err = -3;
         return NULL;
     }
     paging_attach_user_table((uint32_t*)p->page_directory, p->user_table);
 
-    /* --- 映像 --- */
+    /* --- 映像页框：内容等正文读进来 --- */
     need_pages = (hdr->size + hdr->bss_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (need_pages == 0 || need_pages > PROCESS_MAX_IMAGE_PAGES ||
         need_pages + PROCESS_STACK_PAGES > USER_MAX_PAGES) {
-        free_user_resources(p);
-        kfree(p->kernel_stack);
-        p->state = PROC_UNUSED;
+        fail_create(p);
+        *err = -6;                     /* 用户区装不下 */
         return NULL;
     }
 
@@ -335,44 +334,22 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
         void* frame = pmm_alloc_page();
 
         if (!frame) {
-            free_user_resources(p);
-            kfree(p->kernel_stack);
-            p->state = PROC_UNUSED;
+            fail_create(p);
+            *err = -3;
             return NULL;
         }
         p->image_frames[i] = (uint32_t)frame;
         p->image_pages++;
 
-        /* 整页清零：.bss 天然为 0，映像尾部多余的部分也是 0 */
+        /* 整页清零：.bss 天然为 0，映像尾部多余的部分也是 0。
+         * 正文随后按页盖在清零后的页框上。 */
         memset(frame, 0, PAGE_SIZE);
 
         vaddr = USER_BASE + i * PAGE_SIZE;
         if (!paging_map_user_page(p->user_table, vaddr, (uint32_t)frame, true)) {
-            free_user_resources(p);
-            kfree(p->kernel_stack);
-            p->state = PROC_UNUSED;
+            fail_create(p);
+            *err = -3;
             return NULL;
-        }
-    }
-
-    /* 把代码和数据逐页拷进页框。页框之间不一定连续，必须按页算偏移。 */
-    {
-        uint32_t remaining = hdr->size;
-        uint32_t offset    = 0;
-
-        while (remaining > 0) {
-            uint32_t page_index = offset / PAGE_SIZE;
-            uint32_t in_page    = offset % PAGE_SIZE;
-            uint32_t chunk      = PAGE_SIZE - in_page;
-
-            if (chunk > remaining) {
-                chunk = remaining;
-            }
-            memcpy((uint8_t*)p->image_frames[page_index] + in_page,
-                   image + LXE_HEADER_SIZE + offset, chunk);
-
-            offset    += chunk;
-            remaining -= chunk;
         }
     }
 
@@ -385,9 +362,8 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
         void* frame = pmm_alloc_page();
 
         if (!frame) {
-            free_user_resources(p);
-            kfree(p->kernel_stack);
-            p->state = PROC_UNUSED;
+            fail_create(p);
+            *err = -3;
             return NULL;
         }
         p->stack_frames[i] = (uint32_t)frame;
@@ -397,9 +373,8 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
 
         vaddr = USER_BASE + USER_REGION_SIZE - (PROCESS_STACK_PAGES - i) * PAGE_SIZE;
         if (!paging_map_user_page(p->user_table, vaddr, (uint32_t)frame, true)) {
-            free_user_resources(p);
-            kfree(p->kernel_stack);
-            p->state = PROC_UNUSED;
+            fail_create(p);
+            *err = -3;
             return NULL;
         }
     }
@@ -417,31 +392,46 @@ static process_t* create_from_image_locked(const char* filename, const uint8_t* 
 
     init_fds(p);
 
+    *err = 0;
     return p;
 }
 
-/* 加载 .lxe 的暂存区。
+/* 把映像正文分块读进已经建好的页框。
  *
- * **必须放在 BSS 里，不能每次 kmalloc。** 这不是风格问题：
- * 镜像超过 64KB 左右的时候，把这么大一块堆内存当读盘目的地会让整机三重
- * 故障（KNOWN-ISSUES 第 1 节）。排查到现在的结论是：
- *   - 栈是好的：每次时钟中断都把 esp 记进一个堆里的环形缓冲区，从头到尾
- *     都在 0x8Fxxx，从来没有掉下去过（所以不是栈溢出）；
- *   - IDT / 页目录 / 进程表都没被动过：每 10ms 校验一次校验和，掩码一直是 0；
- *   - 和调度无关：读盘期间 sched_lock 住照样崩；
- *   - 读盘本身没问题：换静态缓冲区之后 65KB 的 toobig 一次读完、正常跑起来；
- *   - **把 kfree 去掉照样崩** —— 所以问题不在"释放"，在"拿堆当大缓冲区"这条路上。
- * 根因还没定位（堆块的头部在崩溃后看着都是好的），但这个改法本身也更合理：
- * 加载器只做一次拷贝，不再"先读进堆、再拷进页框"。
+ * 一次最多读一页，读完直接落在目标页框里 —— 内核里**没有**"整份镜像"
+ * 的缓冲区，这也是这次改造的重点（KNOWN-ISSUES 第 1 节）。
+ * 页框是恒等映射的物理地址，所以可以直接当读盘目的地用。
  */
-static uint8_t load_staging[PROCESS_MAX_LOAD_BYTES];
+static bool fill_image_pages(process_t* p, const hneofs_file_t* f,
+                             uint32_t image_size) {
+    uint32_t offset = 0;
+
+    while (offset < image_size) {
+        uint32_t page_index = offset / PAGE_SIZE;
+        uint32_t in_page    = offset % PAGE_SIZE;
+        uint32_t chunk      = PAGE_SIZE - in_page;
+
+        if (chunk > image_size - offset) {
+            chunk = image_size - offset;
+        }
+        if (page_index >= p->image_pages) {
+            return false;              /* 页数对不上，防御性检查 */
+        }
+        if (hneofs_read_at(f, LXE_HEADER_SIZE + offset,
+                           (uint8_t*)p->image_frames[page_index] + in_page,
+                           chunk) != (int32_t)chunk) {
+            return false;              /* 读到一半失败：调用方会把进程拆掉 */
+        }
+        offset += chunk;
+    }
+    return true;
+}
 
 /* 从文件系统读出一个 LXE 并创建进程 */
 static process_t* load_program(const char* filename, const char* args, int* err) {
     const hneofs_file_t* f;
-    uint8_t* image;
+    lxe_header_t hdr;
     process_t* p;
-    int32_t got;
 
     if (!hneofs_mounted()) {
         *err = -2;
@@ -453,51 +443,59 @@ static process_t* load_program(const char* filename, const char* args, int* err)
         *err = -1;
         return NULL;
     }
-    if (f->size < LXE_HEADER_SIZE || f->size > 1024 * 1024) {
+    if (f->size < LXE_HEADER_SIZE) {
+        *err = -1;
+        return NULL;
+    }
+    if (f->size > PROCESS_MAX_LOAD_BYTES) {
+        *err = -6;                     /* 太大了：Shell 会打印一句人话 */
+        return NULL;
+    }
+
+    /* 先只把 40 字节的头读到栈上：建多少页框、要读多少正文全看它。
+     * 头没读全、或者魔数/长度不对，就直接拒绝，一个页框都不用分配。 */
+    if (hneofs_read_at(f, 0, &hdr, LXE_HEADER_SIZE) != (int32_t)LXE_HEADER_SIZE) {
+        *err = -4;
+        return NULL;
+    }
+    if (hdr.magic != LXE_MAGIC || hdr.version != LXE_VERSION) {
+        *err = -1;
+        return NULL;
+    }
+    if (hdr.size == 0 || LXE_HEADER_SIZE + hdr.size > f->size) {
+        *err = -1;
+        return NULL;
+    }
+    if (hdr.entry >= hdr.size) {
         *err = -1;
         return NULL;
     }
 
-    /* 比暂存区还大就只能拒绝：错误码 -6，Shell 会打印一句人话。
-     * 注意这不是"给缺陷打的补丁"，而是暂存区就那么大这个事实本身 ——
-     * 缺陷已经被绕开了（见 load_staging 的注释）。 */
-    if (f->size > PROCESS_MAX_LOAD_BYTES) {
-        *err = -6;
-        return NULL;
-    }
-
-    image = load_staging;
-
-    got = hneofs_read_file(f, image, f->size);
-    if (got < 0) {
-        *err = -4;
-        return NULL;
-    }
-
-    /* 从构造到"参数拷好"之间必须一直关着中断。
+    /* 骨架 + 正文都在这一段里做完，期间用 sched_lock 挡住任务切换。
      *
-     * create_from_image_locked 返回时新任务已经是 PROC_READY 了，
-     * 只要 irq_restore 一执行，时钟中断就能立刻把它切上去跑；而此刻它的
-     * 命令行参数还没拷（getargs 会读到半成品）。这个窗口是真实存在的：
-     * 串口插桩时抓到过切换就发生在参数拷贝之前（[LP2] 和 [SW] 挤在同一行
-     * 输出里）。这段没有磁盘 I/O，关中断的时间很短。
+     * 为什么不是关中断：读正文是几十毫秒的磁盘 I/O，关中断会把键盘和时钟
+     * 一起冻住。而骨架建完时新任务已经是 PROC_READY 了，只是正文还没读进去
+     * —— 这时候要是被切上去跑，跑的就是一个读到一半的程序。sched_lock 正好
+     * 是"中断照进、但不换任务"，和 sys_readfile 里那段用的是同一个办法。
      */
-    {
-        uint32_t flags = irq_save();
-
-        p = create_from_image_locked(filename, image, (uint32_t)got);
-
-        /* 命令行参数交给进程自己保管，程序通过 getargs 系统调用取 */
-        if (p && args) {
-            strncpy(p->args, args, PROCESS_ARGS_MAX - 1);
-            p->args[PROCESS_ARGS_MAX - 1] = '\0';
+    sched_lock();
+    p = create_from_header_locked(filename, &hdr, err);
+    if (p) {
+        if (fill_image_pages(p, f, hdr.size)) {
+            /* 命令行参数交给进程自己保管，程序通过 getargs 系统调用取 */
+            if (args) {
+                strncpy(p->args, args, PROCESS_ARGS_MAX - 1);
+                p->args[PROCESS_ARGS_MAX - 1] = '\0';
+            }
+        } else {
+            fail_create(p);
+            p = NULL;
+            *err = -4;
         }
-
-        irq_restore(flags);
     }
+    sched_unlock();
 
     if (!p) {
-        *err = -5;
         return NULL;
     }
 
