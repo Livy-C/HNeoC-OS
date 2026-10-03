@@ -49,7 +49,10 @@
 
 #define CODE_CAP   (96 * 1024)
 #define DATA_CAP   (96 * 1024)
-#define SRC_CAP    (96 * 1024)
+/* 源码缓冲区。96KB 连 hncc 自己的源码（144KB）都装不下 —— 自举试验里
+ * readfile 会把文件截断，然后报一个跟真正原因无关的语法错（"unexpected
+ * end of file"），所以给到 256KB。反正它是 malloc 出来的，用多少算多少。 */
+#define SRC_CAP    (256 * 1024)
 /* 语法树的缓冲区（只涨不回收）。
  *
  * 512KB 曾经够用，但运行时本身（strlen/printf/malloc/字符串函数……）
@@ -58,9 +61,20 @@
  * 现在给到 1MB：用户区有 4MB，hncc 自身的映像 48KB + bss 132KB，够用。
  * 如果以后还超，优先想办法缩小运行时，而不是继续加这个数。 */
 #define ARENA_CAP  (1024 * 1024)
-#define MAX_LABELS 512
-#define MAX_FIXUPS 1024
-#define MAX_SYMS   128
+/* ---- 各种表的上限 ----
+ *
+ * 这些数字原来是按"几百行的小程序"定的，自举试验（hncc 编译它自己，
+ * 4900 行、135 个函数）一来就全撞上了：先报 "too many functions (limit 64)"，
+ * 再往下还会撞标签、撞结构体字段数。这里按"够编译一个 5000 行的程序"给：
+ *   - 函数 256：hncc 自己 135 个 + 运行时 25 个；
+ *   - 标签 4096 / 待回填 4096：5000 行里几百个 if/while/for，每个要 1~3 个标签；
+ *   - 结构体字段 32：hncc 自己的 struct node 就有 20 个字段（原来限 16 个，
+ *     连它自己的源码都过不去）。
+ * 代价是 hncc 的 .bss 大了一截（约 250KB），用户区 4MB 装得下。
+ */
+#define MAX_LABELS 4096
+#define MAX_FIXUPS 4096
+#define MAX_SYMS   256
 #define MAX_LOCALS 128
 #define MAX_CALL_ARGS 16     /* 函数参数最多 8 个，留一倍余量 */
 
@@ -465,11 +479,32 @@ static void fatal(const char* fmt, ...) {
     exit(1);
 }
 
-static int is_space(int c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+static int is_space(int c) {    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
 static int is_digit(int c) { return c >= '0' && c <= '9'; }
+
+static int is_hex(int c) {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static int hex_val(int c) {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return c - 'A' + 10;
+}
+
+/* '\n' 这种转义字符 -> 它的值 */
+static int escape_char(int c) {
+    if (c == 'n') { return '\n'; }
+    if (c == 't') { return '\t'; }
+    if (c == 'r') { return '\r'; }
+    if (c == '0') { return 0; }
+    if (c == '\\') { return '\\'; }
+    if (c == '\'') { return '\''; }
+    if (c == '"') { return '"'; }
+    return c;
+}
 
 static int is_alpha(int c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
@@ -477,13 +512,17 @@ static int is_alpha(int c) {
 
 static int is_alnum(int c) { return is_alpha(c) || is_digit(c); }
 
+/* 常量表（在下面定义，但 #define 的求值器要用） */
+static int lookup_define(const char* name, int* out);
+static void add_constant(const char* name, int value);
+
 /* 跳过一个 # 指令行。
  *
  * 编译器没有真正的预处理器：#include 直接忽略（运行时是内建的），
  * #define 只认最简单的"名字 数字"形式，之后按常量替换。
  * enum 的枚举名也登记进同一张表（见 parse_enum_def）—— 在代码生成阶段
  * 枚举完全不存在，就是个常量。 */
-#define MAX_CONSTS 64
+#define MAX_CONSTS 256
 
 static char define_names[MAX_CONSTS][64];
 static int  define_values[MAX_CONSTS];
@@ -507,6 +546,228 @@ static void add_constant(const char* name, int value) {
     define_count++;
 }
 
+/* ---- #define 的常量表达式求值 ----
+ *
+ * 以前只认 `#define 名字 十进制数`，于是真实代码里最常见的那些写法
+ * （`(96 * 1024)`、`0x1F`、`(1 << 3)`、引用另一个常量）全都被**静默忽略**，
+ * 然后在用到的地方报一个毫不相干的"undeclared variable"——自举试验第一轮
+ * 卡在 hncc.c 第 96 行的 CODE_CAP 就是这个。
+ *
+ * 现在按 C 的优先级递归下降求值：字面量（十进制/十六进制/字符）、已经定义过
+ * 的常量名、一元 + - ~ !、二元 * / % + - << >> & ^ |、括号。
+ *
+ * 看不懂的写法（函数式宏、字符串宏、类型宏……）返回 ce_ok = 0，调用方照旧
+ * **静默忽略** —— 这一点很重要：真实代码里到处是 `#define SYM(x) ...`
+ * 这类东西，报错反而会挡住一大片能编译的代码。
+ */
+static int ce_ok;
+
+static const char* ce_skip(const char* p) {
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return p;
+}
+
+static int ce_expr(const char** pp);
+
+static int ce_primary(const char** pp) {
+    const char* p = ce_skip(*pp);
+    int v = 0;
+
+    if (*p == '(') {
+        p = ce_skip(p + 1);
+        v = ce_expr(&p);
+        p = ce_skip(p);
+        if (*p != ')') {
+            ce_ok = 0;
+            return 0;
+        }
+        *pp = p + 1;
+        return v;
+    }
+    if (*p == '-') { *pp = p + 1; return -ce_primary(pp); }
+    if (*p == '+') { *pp = p + 1; return ce_primary(pp); }
+    if (*p == '~') { *pp = p + 1; return ~ce_primary(pp); }
+    if (*p == '!') { *pp = p + 1; return !ce_primary(pp); }
+
+    if (is_digit(*p)) {
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            p += 2;
+            if (!is_hex(*p)) { ce_ok = 0; return 0; }
+            while (is_hex(*p)) {
+                v = v * 16 + hex_val(*p);
+                p++;
+            }
+        } else {
+            while (is_digit(*p)) {
+                v = v * 10 + (*p - '0');
+                p++;
+            }
+        }
+        *pp = p;
+        return v;
+    }
+
+    if (*p == '\'') {
+        /* 字符字面量：支持 '\n' 这种转义，也支持 '\0' */
+        p++;
+        if (*p == '\\' && p[1] != '\0') {
+            p++;
+            v = escape_char(*p);
+            p++;
+        } else if (*p != '\0') {
+            v = (unsigned char)*p;
+            p++;
+        } else {
+            ce_ok = 0;
+            return 0;
+        }
+        if (*p != '\'') {
+            ce_ok = 0;
+            return 0;
+        }
+        *pp = p + 1;
+        return v;
+    }
+
+    if (is_alpha(*p) || *p == '_') {
+        char name[64];
+        int k = 0;
+
+        while ((is_alnum(*p) || *p == '_') && k < (int)sizeof(name) - 1) {
+            name[k++] = *p++;
+        }
+        name[k] = '\0';
+        if (!lookup_define(name, &v)) {
+            ce_ok = 0;             /* 还没定义过的名字：交给调用方忽略 */
+            return 0;
+        }
+        *pp = p;
+        return v;
+    }
+
+    ce_ok = 0;
+    return 0;
+}
+
+/* 二元运算的优先级链（低 -> 高）：| ^ & << >> + - * / % */
+static int ce_mul(const char** pp) {
+    int v = ce_primary(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (*p == '*' && p[1] != '/') {
+            *pp = p + 1;
+            v = v * ce_primary(pp);
+        } else if (*p == '/') {
+            int rhs;
+
+            *pp = p + 1;
+            rhs = ce_primary(pp);
+            if (rhs == 0) {
+                ce_ok = 0;         /* 除以零：别让编译器自己崩掉 */
+                return 0;
+            }
+            v = v / rhs;
+        } else if (*p == '%') {
+            int rhs;
+
+            *pp = p + 1;
+            rhs = ce_primary(pp);
+            if (rhs == 0) {
+                ce_ok = 0;
+                return 0;
+            }
+            v = v % rhs;
+        } else {
+            return v;
+        }
+    }
+}
+
+static int ce_add(const char** pp) {
+    int v = ce_mul(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (*p == '+') {
+            *pp = p + 1;
+            v = v + ce_mul(pp);
+        } else if (*p == '-') {
+            *pp = p + 1;
+            v = v - ce_mul(pp);
+        } else {
+            return v;
+        }
+    }
+}
+
+static int ce_shift(const char** pp) {
+    int v = ce_add(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (p[0] == '<' && p[1] == '<') {
+            *pp = p + 2;
+            v = v << ce_add(pp);
+        } else if (p[0] == '>' && p[1] == '>') {
+            *pp = p + 2;
+            v = v >> ce_add(pp);
+        } else {
+            return v;
+        }
+    }
+}
+
+static int ce_and(const char** pp) {
+    int v = ce_shift(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (*p == '&' && p[1] != '&') {
+            *pp = p + 1;
+            v = v & ce_shift(pp);
+        } else {
+            return v;
+        }
+    }
+}
+
+static int ce_xor(const char** pp) {
+    int v = ce_and(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (*p == '^') {
+            *pp = p + 1;
+            v = v ^ ce_and(pp);
+        } else {
+            return v;
+        }
+    }
+}
+
+static int ce_expr(const char** pp) {
+    int v = ce_xor(pp);
+
+    for (;;) {
+        const char* p = ce_skip(*pp);
+
+        if (*p == '|' && p[1] != '|') {
+            *pp = p + 1;
+            v = v | ce_xor(pp);
+        } else {
+            return v;
+        }
+    }
+}
+
 static void skip_directive(void) {
     char line[256];
     int n = 0;
@@ -519,11 +780,18 @@ static void skip_directive(void) {
     }
     line[n] = '\0';
 
-    /* 只处理 "#define NAME 123" */
+    /* 处理 "#define 名字 常量表达式"。
+     *
+     * 表达式先过一遍注释剥离：宏定义后面跟一段中文说明是常态
+     * （`#define MAX_CALL_ARGS 16` 后面接一段块注释），不剥的话求值器会在
+     * 数字后面撞上斜杠，整个宏就被当成"看不懂"忽略掉了 ——
+     * MAX_CALL_ARGS 于是变成未声明，报错还指在几百行之外。 */
     if (strncmp(line, "#define", 7) == 0) {
         const char* p = line + 7;
         char name[64];
         int k = 0;
+        char body[192];
+        int b = 0;
 
         while (*p == ' ' || *p == '\t') {
             p++;
@@ -535,14 +803,36 @@ static void skip_directive(void) {
         while (*p == ' ' || *p == '\t') {
             p++;
         }
-        if (k > 0 && is_digit(*p)) {
-            int v = 0;
 
-            while (is_digit(*p)) {
-                v = v * 10 + (*p - '0');
-                p++;
+        while (*p && b < (int)sizeof(body) - 1) {
+            if (p[0] == '/' && p[1] == '/') {
+                break;                         /* 行注释到行尾 */
             }
-            add_constant(name, v);
+            if (p[0] == '/' && p[1] == '*') {
+                p += 2;
+                while (*p && !(p[0] == '*' && p[1] == '/')) {
+                    p++;
+                }
+                if (*p) {
+                    p += 2;
+                }
+                continue;
+            }
+            body[b++] = *p++;
+        }
+        body[b] = '\0';
+
+        if (k > 0 && b > 0) {
+            const char* q = body;
+            int v;
+
+            ce_ok = 1;
+            v = ce_expr(&q);
+            q = ce_skip(q);
+            if (ce_ok && *q == '\0') {
+                add_constant(name, v);
+            }
+            /* 看不懂就照旧静默忽略：函数式宏、字符串宏、类型宏都走这里。 */
         }
     }
 }
@@ -882,7 +1172,7 @@ typedef struct {
  * 对齐到 4 之后所有字段的访存都是对齐的，反汇编出来也好读。
  */
 #define MAX_STRUCTS 32
-#define MAX_FIELDS  16
+#define MAX_FIELDS  32
 
 typedef struct {
     char    name[32];
@@ -942,7 +1232,7 @@ static int base_size(int base) {
  * 所以这张表只被 parse_type / is_type_kw 查，不会和变量名、函数名打架。
  * 这也意味着 typedef 必须先声明后使用 —— 在单文件编译器里这是可以接受的。
  */
-#define MAX_TYPEDEFS 32
+#define MAX_TYPEDEFS 64
 
 typedef struct {
     char    name[32];
@@ -962,11 +1252,33 @@ static int find_typedef(const char* name) {
     return -1;
 }
 
+/* 两个类型是不是同一个东西（用来容忍"重复 typedef 同一个类型"） */
+static int same_type(vtype_t a, vtype_t b) {
+    if (a.base != b.base || a.ptr != b.ptr || a.ndims != b.ndims ||
+        a.is_struct != b.is_struct || a.sidx != b.sidx) {
+        return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (a.dims[i] != b.dims[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void add_typedef(const char* name, vtype_t t) {
     int ti = find_typedef(name);
 
     if (ti >= 0) {
-        fatal("'%s' is already a typedef", name);
+        /* 重复定义**同一个**类型不算错：编译器自己就内建了 uint32_t/size_t
+         * 那一套（见 TYPE_SOURCE），而用户的源码里常常再 typedef 一遍
+         * （`typedef unsigned int uint32_t;` 这种，或者直接来自某个头文件）。
+         * 定义成**别的**类型才算错 —— 那是真的在打架，静默覆盖只会让人
+         * 查半天。 */
+        if (same_type(typedefs[ti].type, t)) {
+            return;
+        }
+        fatal("'%s' is already a typedef, and with a different type", name);
     }
     if (typedef_n >= MAX_TYPEDEFS) {
         fatal("too many typedefs (limit %d)", MAX_TYPEDEFS);
@@ -1117,7 +1429,7 @@ typedef struct node {
 } node_t;
 
 /* 全局符号：函数 + 全局变量 */
-#define MAX_FUNCS 64
+#define MAX_FUNCS 256
 
 struct sym_func {
     char name[64];
@@ -1216,7 +1528,7 @@ static vtype_t parse_type(void);
 static node_t* parse_declaration(int eat_semi);
 static void parse_array_dims(vtype_t* t);
 static void parse_struct_def(const char* name, int eat_semi);
-static void parse_enum_def(const char* name);
+static void parse_enum_def(const char* name, int eat_semi);
 static int  parse_case_const(void);
 
 static int is_type_kw(void) {
@@ -1378,31 +1690,27 @@ static void parse_struct_def(const char* name, int eat_semi)
  * 枚举名当成常量登记进 #define 那张表（见 add_constant），所以代码生成
  * 阶段完全看不到枚举：`if (c == RED)` 里的 RED 在解析时就被换成 0。
  * 不给枚举建类型表，是因为这个子集里枚举只用来起名字。 */
-static void parse_enum_def(const char* name)
+static int parse_case_const(void);
+
+/* eat_semi 和 parse_struct_def 是同一个道理：`typedef enum { ... } Alias;`
+ * 里 `}` 后面直接就是别名，分号在别名后面，不能在这里吃掉。 */
+static void parse_enum_def(const char* name, int eat_semi)
 {
     int value = 0;
+
+    (void)name;                        /* 只在报错时用过，现在求值器自己会报 */
 
     lex_next();                        /* 吃掉 '{' */
 
     while (!is_punct("}")) {
         char ename[64];
-        int  neg = 0;
 
         expect_ident(ename, sizeof(ename));
 
+        /* 值可以是常量表达式（`WARN = 7`、`MASK = (1 << 3)`、`N = OTHER + 1`），
+         * 和 case、数组长度用的是同一个求值器。 */
         if (accept_punct("=")) {
-            if (accept_punct("-")) {
-                neg = 1;
-            }
-            if (tok.kind != TK_NUM) {
-                fatal("enum '%s': the value of '%s' must be a number",
-                      name, ename);
-            }
-            value = (int)tok.num;
-            if (neg) {
-                value = -value;
-            }
-            lex_next();
+            value = parse_case_const();
         }
 
         add_constant(ename, value);
@@ -1413,7 +1721,9 @@ static void parse_enum_def(const char* name)
         }
     }
     expect_punct("}");
-    expect_punct(";");
+    if (eat_semi) {
+        expect_punct(";");
+    }
 }
 
 /* 二元：都从子层拿左值，遇到对应的运算符就继续往上套 */
@@ -2085,11 +2395,18 @@ static void parse_array_dims(vtype_t* t) {
             lex_next();
             continue;
         }
-        if (tok.kind != TK_NUM) {
-            fatal("array size must be a number (or empty, with an initialiser)");
+        /* 数组长度可以是常量表达式，不只是数字字面量：
+         * `static int label_pc[MAX_LABELS];` 这种写法到处都是
+         * （自举试验里 hncc.c 第 313 行就是 MAX_FIXUPS）。
+         * 复用 case 那套常量求值器：数字、字符、常量名、+ - * / 和括号都行。 */
+        {
+            int n = parse_case_const();
+
+            if (n <= 0) {
+                fatal("array size must be positive (got %d)", n);
+            }
+            t->dims[t->ndims++] = n;
         }
-        t->dims[t->ndims++] = tok.num;
-        lex_next();
         expect_punct("]");
     }
 }
@@ -2207,6 +2524,87 @@ static node_t* parse_declaration(int eat_semi) {
             }
         }
 
+        /* `typedef enum { A, B } Alias;` —— 匿名枚举 + 别名。
+         * 枚举本身只往常量表里登记名字（见 parse_enum_def），别名登记的
+         * 是 int：这个子集里枚举就是 int。hncc 自己的源码第 450 行就是
+         * `typedef enum { TK_EOF, ... } tk_kind;`。 */
+        if (is_kw("enum")) {
+            const char* save_p    = lex_p;
+            token_t     save_tok  = tok;
+            int         save_line = src_line;
+            char        ename[32];
+            int         is_def    = 0;
+
+            lex_next();
+            if (tok.kind == TK_IDENT) {
+                copy_str_local(ename, tok.text, sizeof(ename));
+                lex_next();
+                if (is_punct("{")) {
+                    is_def = 1;
+                }
+            } else if (is_punct("{")) {
+                char* np = ename;
+                int   v  = ++anon_struct_n;
+
+                *np++ = '$';
+                *np++ = 'e';
+                *np++ = 'n';
+                *np++ = 'u';
+                *np++ = 'm';
+                if (v >= 10) {
+                    char digits[12];
+                    int  k = 0;
+
+                    while (v > 0) {
+                        digits[k++] = (char)('0' + v % 10);
+                        v /= 10;
+                    }
+                    while (k > 0) {
+                        *np++ = digits[--k];
+                    }
+                } else {
+                    *np++ = (char)('0' + v);
+                }
+                *np = '\0';
+                is_def = 1;
+            }
+
+            if (is_def) {
+                vtype_t et;
+
+                parse_enum_def(ename, 0);      /* 吃掉 body，但不吃 ';' */
+
+                memset(&et, 0, sizeof(et));
+                et.base = TY_INT;
+
+                if (accept_punct(";")) {
+                    return NULL;               /* 没有别名，就是一条枚举定义 */
+                }
+                for (;;) {
+                    vtype_t t2 = et;
+                    char    tname[32];
+
+                    expect_ident(tname, sizeof(tname));
+                    while (accept_punct("*")) {
+                        t2.ptr++;
+                    }
+                    if (is_punct("[")) {
+                        parse_array_dims(&t2);
+                    }
+                    add_typedef(tname, t2);
+                    if (!accept_punct(",")) {
+                        break;
+                    }
+                }
+                expect_punct(";");
+                return NULL;
+            }
+
+            lex_p    = save_p;
+            tok      = save_tok;
+            src_line = save_line;
+        }
+
         tt = parse_type();
 
         {
@@ -2261,7 +2659,7 @@ static node_t* parse_declaration(int eat_semi) {
             }
         }
         if (is_def) {
-            parse_enum_def(ename);
+            parse_enum_def(ename, 1);      /* 普通枚举定义：连 ';' 一起吃掉 */
             return NULL;
         }
         lex_p    = save_p;
@@ -2546,53 +2944,136 @@ static node_t* parse_declaration(int eat_semi) {
     }
 }
 
-/* case 的常量表达式。
+/* 常量表达式（在 token 流上求值）。
  *
- * 支持：十进制/十六进制字面量、字符常量、常量表里的名字（enum 成员、
- * #define），以及它们之间的一元 +- 和二元 +-。
- * 不支持 '* / ( )' —— 那几个在 case 里本来就少见，宁可报错也别算错，
- * 而"只认数字字面量"更糟：`case RED:` 这种写法直接编译不过。
+ * 用在三个地方：`case` 的值、数组长度、枚举的值。三处都需要同一件事，
+ * 所以只有这一份实现，按 C 的优先级递归下降：
+ *     一元  + - ~ !        乘除  * / %        加减  + -
+ *     移位  << >>          按位  & ^ |        括号  ( )
+ * 操作数可以是十进制/十六进制字面量、字符常量、常量表里的名字
+ * （enum 成员、#define）。
+ *
+ * 第一版只认"数字和 +-"，于是 `case RED:` 能过、`case (1 << 3):` 和
+ * `int a[4 * 2]` 全报 "needs a constant value" —— 自举试验里 hncc.c
+ * 的 `MAX_FIXUPS`、`(1 << 3)` 这些写法立刻就把这个短板暴露出来了。
  */
-static int parse_case_const_term(void) {
+static int parse_const_unary(void);
+
+static int parse_const_primary(void) {
     int v = 0;
-    int neg = 0;
 
-    for (;;) {
-        if (accept_punct("-")) {
-            neg = !neg;
-        } else if (accept_punct("+")) {
-            /* 一元正号，没用 */
-        } else {
-            break;
-        }
+    if (accept_punct("(")) {
+        v = parse_case_const();
+        expect_punct(")");
+        return v;
     }
-
     if (tok.kind == TK_NUM || tok.kind == TK_CHARLIT) {
         v = (int)tok.num;
         lex_next();
-    } else if (tok.kind == TK_IDENT) {
+        return v;
+    }
+    if (tok.kind == TK_IDENT) {
         if (!lookup_define(tok.text, &v)) {
-            fatal("'case' value '%s' is not a constant "
-                  "(enum member or #define)", tok.text);
+            fatal("'%s' is not a constant (enum member or #define)",
+                  tok.text);
         }
         lex_next();
-    } else {
-        fatal("'case' needs a constant value");
+        return v;
     }
-    return neg ? -v : v;
+    fatal("a constant expression was expected here");
+    return 0;
 }
 
-static int parse_case_const(void) {
-    int v = parse_case_const_term();
+static int parse_const_unary(void) {
+    if (accept_punct("-")) { return -parse_const_unary(); }
+    if (accept_punct("+")) { return parse_const_unary(); }
+    if (accept_punct("~")) { return ~parse_const_unary(); }
+    if (accept_punct("!")) { return !parse_const_unary(); }
+    return parse_const_primary();
+}
+
+/* 每一层都是"拿左值，遇到本层的运算符就继续往上套" */
+static int parse_const_mul(void) {
+    int v = parse_const_unary();
+
+    for (;;) {
+        if (accept_punct("*")) {
+            v = v * parse_const_unary();
+        } else if (accept_punct("/")) {
+            int r = parse_const_unary();
+
+            if (r == 0) {
+                fatal("division by zero in a constant expression");
+            }
+            v = v / r;
+        } else if (accept_punct("%")) {
+            int r = parse_const_unary();
+
+            if (r == 0) {
+                fatal("modulo by zero in a constant expression");
+            }
+            v = v % r;
+        } else {
+            return v;
+        }
+    }
+}
+
+static int parse_const_add(void) {
+    int v = parse_const_mul();
 
     for (;;) {
         if (accept_punct("+")) {
-            v += parse_case_const_term();
+            v = v + parse_const_mul();
         } else if (accept_punct("-")) {
-            v -= parse_case_const_term();
+            v = v - parse_const_mul();
         } else {
-            break;
+            return v;
         }
+    }
+}
+
+static int parse_const_shift(void) {
+    int v = parse_const_add();
+
+    for (;;) {
+        if (accept_punct("<<")) {
+            v = v << parse_const_add();
+        } else if (accept_punct(">>")) {
+            v = v >> parse_const_add();
+        } else {
+            return v;
+        }
+    }
+}
+
+static int parse_const_and(void) {
+    int v = parse_const_shift();
+
+    for (;;) {
+        /* 注意别把 '&&' 吃掉：它不是本层的东西（常量里也不该出现） */
+        if (is_punct("&") && accept_punct("&")) {
+            v = v & parse_const_shift();
+        } else {
+            return v;
+        }
+    }
+}
+
+static int parse_const_xor(void) {
+    int v = parse_const_and();
+
+    while (accept_punct("^")) {
+        v = v ^ parse_const_and();
+    }
+    return v;
+}
+
+static int parse_case_const(void) {
+    int v = parse_const_xor();
+
+    while (is_punct("|") && accept_punct("|")) {
+        v = v | parse_const_xor();
     }
     return v;
 }
@@ -4010,7 +4491,35 @@ static void gen_function(int fi) {
 }
 
 /* ============================================================
- * 9. 自带运行时（用这个子集写的 C 源码） *
+ * 9. 内建类型别名
+ *
+ * 真实 C 代码（包括 hncc 自己的源码）几乎都用 <stdint.h> / <stddef.h>
+ * 那一套名字，而这个编译器不看 #include —— 不内建它们，连自举的第一行
+ * 都过不去：hncc.c 第 79 行就是 `uint32_t`，不认就是
+ * "expected a type (int / char / void / struct)"。
+ *
+ * 宽度说明：这个子集里 int 就是 32 位，没有真正的 16/8 位语义，
+ * 所以 uint16_t / int8_t 这些只是"名字能用"，不代表真的按那个宽度算。
+ * 这一点和 static/const/long 那些修饰词是同一个态度：接受，但不假装。
+ * ============================================================ */
+
+static const char* TYPE_SOURCE =
+    "typedef unsigned char  uint8_t;\n"
+    "typedef signed char    int8_t;\n"
+    "typedef unsigned short uint16_t;\n"
+    "typedef short          int16_t;\n"
+    "typedef unsigned int   uint32_t;\n"
+    "typedef int            int32_t;\n"
+    "typedef unsigned int   uintptr_t;\n"
+    "typedef unsigned int   size_t;\n"
+    "typedef int            ssize_t;\n"
+    "typedef int            bool;\n"
+    "typedef unsigned char  byte;\n"
+    "typedef unsigned short word;\n"
+    "typedef unsigned int   dword;\n";
+
+/* ============================================================
+ * 9b. 自带运行时（用这个子集写的 C 源码） *
  * 编译用户代码之前先把它编译一遍：既是"标准库"，也是每次编译
  * 都跑一遍的自测。保留字前缀 rt_ 是运行时自己用的全局变量。
  * ============================================================ */
@@ -4506,6 +5015,13 @@ int main(void) {
         err("cannot read the source file", src_path);
         return 1;
     }
+    /* readfile 是"最多读这么多"，文件更大就静默截断。截断之后报出来的
+     * 语法错（往往在文件末尾）和真正的原因（源文件太大）看着毫无关系，
+     * 所以这里主动说一句。 */
+    if (src_len >= SRC_CAP - 1) {
+        err("source file is bigger than the compiler's buffer", src_path);
+        return 1;
+    }
     src_buf[src_len] = '\0';
 
     /* --- 编译 --- */
@@ -4518,6 +5034,11 @@ int main(void) {
     add_constant("NULL", 0);
     add_constant("true", 1);
     add_constant("false", 0);
+
+    src_name = "<hncc types>";
+    lex_p = TYPE_SOURCE;
+    src_line = 1;
+    parse_program();
 
     src_name = "<hncc runtime>";
     lex_p = RT_SOURCE;

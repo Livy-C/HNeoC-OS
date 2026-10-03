@@ -11,10 +11,19 @@
  *     8 42             switch 体里的局部变量要有栈槽
  *     9 -3             case 的值可以是 enum 常量（含负数）
  *    10 2              case 的值可以是常量表达式（WARN - 5）
+ *    11 1 8 3          匿名枚举 + typedef，以及用表达式当枚举值
  */
 
 enum color { RED, GREEN, BLUE };
 enum code { OK = 0, WARN = 7, FAIL = -3 };
+
+/* 匿名枚举 + typedef（hncc 自己的源码就是这么写 tk_kind 的） */
+typedef enum { LOW, MID, HIGH } level;
+typedef enum { SHIFTED = (1 << 3) } bits;
+
+int pick(level l) {
+    return l + 1;
+}
 
 int describe(int c) {
     int r;
@@ -128,6 +137,13 @@ int main(void) {
                 printf("10 default\n");
                 break;
         }
+    }
+
+    /* 匿名枚举 typedef 出来的类型能当类型用、能当参数类型用 */
+    {
+        level lv = MID;
+
+        printf("11 %d %d %d\n", pick(lv), SHIFTED, HIGH + 1);
     }
 
     return 0;

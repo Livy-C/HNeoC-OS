@@ -546,6 +546,18 @@ if ($pkgDirs.Count -gt 0) {
     Write-Ok "$packed 个软件包进了本地源（fsroot\var\hpm\repo）"
 }
 
+# --- 6b-3. 把 hncc 自己的源码放进 /share/hncc/ -----------------
+# 用来做自举试验：在系统里 `hncc /share/hncc/hncc.c` 编译它自己。
+# 这是从 user/hncc.c **拷**过去的（生成的副本，不进版本库），
+# 免得仓库里躺两份一模一样的四千行源码。
+$selfSrc = Join-Path $fsRoot "share\hncc\hncc.c"
+if (Test-Path (Join-Path $root "user\hncc.c")) {
+    $shareDir = Split-Path $selfSrc -Parent
+    if (-not (Test-Path $shareDir)) { New-Item -ItemType Directory -Path $shareDir -Force | Out-Null }
+    Copy-Item (Join-Path $root "user\hncc.c") $selfSrc -Force
+    Write-Ok "share/hncc/hncc.c（hncc 自己的源码，给自举试验用）"
+}
+
 # --- 6c. 把 fsroot/ 里的文件打包成 HNeoFS -----------------
 if (Test-Path $fsRoot) {
     $mkfs = Join-Path $root "tools\mkfs.ps1"

@@ -7,7 +7,7 @@
 static hneofs_super_t  superblock;
 static bool            mounted = false;
 
-/* 文件表常驻内存：8 个扇区 = 4KB = 64 个目录项 */
+/* 文件表常驻内存：16 个扇区 = 8KB = 128 个目录项 */
 static hneofs_file_t   file_table[HNEOFS_MAX_FILES];
 
 /* 一次 ATA 读写最多搬多少扇区 */

@@ -260,7 +260,7 @@ $checks = @(
     @{ Name = "hncc enum/switch output is correct"; Send = @("/share/hncc/t5.lxe");
        Expect = @("1 0 1 2 3", "2 0 7 -3", "3 100 200 300 999",
                   "4 14", "5 110", "6 27", "7 10000", "8 42",
-                  "9 -3", "10 2") },
+                  "9 -3", "10 2", "11 2 8 3") },
 
     # typedef (struct/int/pointer), a struct forward declaration so two structs
     # can point at each other, the runtime string functions, and NULL.
@@ -282,6 +282,31 @@ $checks = @(
        Send = @("/share/hncc/t7.lxe");
        Expect = @("1 11 22 8", "2 33 44", "3 7 6", "4 9",
                   "5 8", "6 6", "7 ffffffff") },
+
+    # Built-in type aliases (uint32_t / size_t / bool ...). hncc ignores
+    # #include, so without them its own source does not even get past line 79.
+    @{ Name = "hncc compiles t8.c (stdint names)"; Send = @("hncc /share/hncc/t8.c");
+       Expect = @("compiled /share/hncc/t8\.c") },
+
+    @{ Name = "hncc stdint-name output is correct"; Send = @("/share/hncc/t8.lxe");
+       Expect = @("1 1 4 4", "2 42 42", "3 7", "4 1 0", "5 4 1", "6 12345678") },
+
+    # ... and re-typedef'ing one of them is tolerated, but a *conflicting*
+    # typedef is still an error (that one would silently change semantics).
+    @{ Name = "hncc rejects a conflicting typedef";
+       Send = @("hncc /share/hncc/badtypedef.c");
+       Expect = @("already a typedef, and with a different type") },
+
+    # #define now evaluates a constant expression (arithmetic, hex, char
+    # literals, references to earlier constants, parentheses, bit ops)
+    # instead of only accepting a plain decimal number.
+    @{ Name = "hncc compiles t9.c (#define expressions)";
+       Send = @("hncc /share/hncc/t9.c");
+       Expect = @("compiled /share/hncc/t9\.c") },
+
+    @{ Name = "hncc #define output is correct"; Send = @("/share/hncc/t9.lxe");
+       Expect = @("1 98304", "2 31", "3 8", "4 7", "5 12", "6 3", "7 4",
+                  "8 65 10", "9 1024", "10 9 abcdefgh") },
 
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },

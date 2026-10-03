@@ -3,8 +3,8 @@
 #
 #  Layout (see include/hneofs.h):
 #    LBA 2048        superblock (512 bytes)
-#    LBA 2049-2056   file table (8 sectors = 64 entries of 64 bytes)
-#    LBA 2057-...    file data, files packed back to back
+#    LBA 2049-2064   file table (16 sectors = 128 entries of 64 bytes)
+#    LBA 2065-...    file data, files packed back to back
 #
 #  The source directory is walked recursively and turned into a tree:
 #  every subdirectory becomes a directory entry, every file a file entry,
@@ -33,7 +33,11 @@ $VERSION        = [uint32]2
 $BLOCK          = 512
 $FS_START_LBA   = 2048
 $TABLE_LBA      = $FS_START_LBA + 1
-$TABLE_SECTORS  = 8
+# 16 sectors = 128 entries。原来是 8 个扇区（64 项），镜像里现在装了
+# 48 个文件，跑一轮回归还要在 /share/hncc 下现编出十来个 .lxe ——
+# 剩不下几个槽位，hpm 一装包就会把目录占满，然后 hncc 报
+# "cannot create the output file"。目录表是固定长度的，所以一次给够。
+$TABLE_SECTORS  = 16
 $DATA_LBA       = $TABLE_LBA + $TABLE_SECTORS
 $NAME_MAX       = 32
 $ENTRY_SIZE     = 64

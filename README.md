@@ -158,8 +158,8 @@ BIOS
 LBA 0                   引导扇区
 LBA 1-256               内核（128KB）
 LBA 2048                超级块（魔数 'HNFS'）
-LBA 2049-2056           文件表（8 个扇区 = 64 个 64 字节目录项）
-LBA 2057-...            文件数据，按目录项顺序连续排布
+LBA 2049-2064           文件表（16 个扇区 = 128 个 64 字节目录项）
+LBA 2065-...            文件数据，按目录项顺序连续排布
 ```
 
 没有 inode、没有分配位图、没有日志。文件就是"起始 LBA + 长度"，
@@ -550,14 +550,15 @@ counter after the loop:
 
 | 支持 | 说明 |
 |------|------|
-| 类型 | `int` `char` `void`、指针、数组、`struct`、`enum`、`typedef`；`static` `const` `unsigned` `signed` `long` `short` 都接受（见下） |
+| 类型 | `int` `char` `void`、指针、数组、`struct`、`enum`、`typedef`；`uint8_t/uint16_t/uint32_t/int32_t/size_t/bool` 这些名字**内建**（它不看 `#include`）；`static` `const` `unsigned` `signed` `long` `short` 都接受（见下） |
 | 语句 | 声明（可带初值，`int a = 1, *b;` 这样一串也行）、`if/else`、`while`、`do-while`、`for`、`switch/case/default`、`return`、`break`、`continue` |
 | 运算 | `+ - * / %`、比较、`&& \|\|`（短路）、`! ~ & \| ^ << >>`、`++ --`、赋值与复合赋值、`? :`、`[]`、`()`、`&` `*`、`sizeof`、强制类型转换 |
 | 结构体 | `struct T { ... };` 定义、前向声明（`struct T;`，于是两个结构体能互相指）、`a.f`、`p->f`（可以串起来：`p->next->value`）、结构体数组、`sizeof(struct T)`、`typedef struct T { ... } Alias;` 和匿名的 `typedef struct { ... } Alias;` |
-| 枚举与分支 | `enum Color { RED, GREEN = 7, FAIL = -3 };`（枚举名就是常量）、`switch`/`case`/`default`（含 `case 2: case 3:` 连着写、fall-through、`break` 只跳 `switch`、`continue` 跳外层循环）；`case` 的值可以是枚举名/`#define` 常量和它们的 `+` `-` |
+| 枚举与分支 | `enum Color { RED, GREEN = 7, FAIL = -3 };`（枚举名就是常量）、匿名的 `enum { A, B };` 和 `typedef enum { A, B } Alias;`、`switch`/`case`/`default`（含 `case 2: case 3:` 连着写、fall-through、`break` 只跳 `switch`、`continue` 跳外层循环） |
+| 常量表达式 | `case` 的值、数组长度、枚举的值都按 C 的优先级求值：`(96 * 1024)`、`0x1F`、`1 << 3`、`MAX_FIXUPS`、`'A'`、`4 * 2 + 1` 都能用 |
 | 初始化 | `int a[4] = {1,2,3,4};`（全局和局部都行，没写到的位置留 0）、`char s[] = "abc";`、`int a[] = {1,2,3};`（长度自动推断） |
 | 变参 | `printf(fmt, ...)`；自己写带 `...` 的函数也行 —— 参数从右往左压栈，所以第一个参数在最低地址，往后数就是可变参数 |
-| 其它 | 函数（递归、前置声明）、全局变量、字符串/字符字面量、注释、`#define` 常量（只认 `#define 名字 十进制数字` 这一种写法，别的一律静默忽略；常量表上限 64 条，和其它常量共用一张表）、`#include` 直接忽略 |
+| 其它 | 函数（递归、前置声明）、全局变量、字符串/字符字面量、注释、`#define` 常量（值可以是常量表达式，看不懂的写法静默忽略）、`#include` 直接忽略 |
 
 结构体的字段按 4 字节对齐（每个字段、以及结构体整体），偏移在定义时算好。
 
@@ -572,6 +573,13 @@ counter after the loop:
 （逐字段赋值代替）。另外两条容易踩的：局部变量**不能**和 `typedef` 名重名
 （`typedef int T;` 之后再写 `int T;`，那个位置会被当成类型名）；
 调用实参最多 16 个（超过会明确报错，不会默默截断）。
+
+**自举试验**：`build.ps1` 会把 `user/hncc.c` 拷进镜像的 `/share/hncc/hncc.c`，
+所以可以直接在系统里跑 `hneoc$root~/share/hncc hncc hncc.c` —— 让 hncc 编译它自己。
+这条路的价值在于它拿一份 4900 行的真实程序去撞编译器的每一条限制：
+撞出来的每个缺口都补上了对应的一组 `tN.c` 诊断和回归检查。
+进度和还差什么写在 `KNOWN-ISSUES.md` 第 4 节（现在卡在"内建 term_* 函数"
+和"AST 节点太大"这两件事上）。
 
 结构体的三条限制（都是**明确报错**，不会默默生成坏代码）：
 - 结构体只能通过**指针**传递和返回，不能按值传（`int f(struct T x)` 会被拒绝：

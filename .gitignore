@@ -11,6 +11,9 @@ build/
 *.lxe
 fsroot/bin/
 
+# build.ps1 从 user/hncc.c 拷进 fsroot 的自举试验源码
+fsroot/share/hncc/hncc.c
+
 # 调试产物
 *.map
 *.sym

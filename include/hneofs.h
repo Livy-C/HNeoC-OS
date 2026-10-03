@@ -18,8 +18,8 @@
  * 磁盘上的布局（从 1MB 处开始，给内核留足空间）：
  *
  *   LBA 2048                超级块（512 字节）
- *   LBA 2049 - 2056         文件表（8 个扇区 = 64 个目录项）
- *   LBA 2057 - ...          文件数据区，按目录项顺序连续排布
+ *   LBA 2049 - 2064         文件表（16 个扇区 = 128 个目录项）
+ *   LBA 2065 - ...          文件数据区，按目录项顺序连续排布
  * ============================================================ */
 
 #define HNEOFS_MAGIC        0x53464E48u   /* 'HNFS' 小端 */
@@ -28,7 +28,10 @@
 #define HNEOFS_BLOCK_SIZE   512
 #define HNEOFS_START_LBA    2048          /* 1MB 处 */
 #define HNEOFS_TABLE_LBA    (HNEOFS_START_LBA + 1)
-#define HNEOFS_TABLE_SECTORS 8
+/* 目录表定长 16 个扇区 = 128 项。镜像里现在装着 48 个文件，而跑一轮回归
+ * 还要在 /share/hncc 下现编出十来个 .lxe，8 个扇区（64 项）已经不够：
+ * hpm 一装包就会把目录占满，hncc 接着报 "cannot create the output file"。 */
+#define HNEOFS_TABLE_SECTORS 16
 #define HNEOFS_DATA_LBA     (HNEOFS_TABLE_LBA + HNEOFS_TABLE_SECTORS)
 
 #define HNEOFS_NAME_MAX     32
