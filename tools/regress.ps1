@@ -308,6 +308,17 @@ $checks = @(
        Expect = @("1 98304", "2 31", "3 8", "4 7", "5 12", "6 3", "7 4",
                   "8 65 10", "9 1024", "10 9 abcdefgh") },
 
+    # The runtime grew a real output layer for self-hosting: fprintf / fputs /
+    # fputc / vsnprintf all share one formatter with printf, and the TERM_* /
+    # STD*_FILENO constants are built in (hncc ignores #include).
+    @{ Name = "hncc compiles t10.c (fprintf/vsnprintf)";
+       Send = @("hncc /share/hncc/t10.c");
+       Expect = @("compiled /share/hncc/t10\.c") },
+
+    @{ Name = "hncc stdio/term output is correct"; Send = @("/share/hncc/t10.lxe");
+       Expect = @("1 42 7ff", "2 5 abcde", "2 ret 10", "01234", "3 ret 10",
+                  "4 hi!", "5 OK", "6 0 1 2") },
+
     @{ Name = "login as guest";   Send = @("login", "guest", "guest");
        Expect = @("welcome, guest") },
 

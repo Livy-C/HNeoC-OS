@@ -1252,6 +1252,33 @@ static int find_typedef(const char* name) {
     return -1;
 }
 
+/* 造一个内部名字，比如 "$anon3" / "$enum2"。
+ *
+ * 匿名结构体、匿名枚举都没有名字，但结构体表和 typedef 表都要有个键，
+ * 所以给它们一个用户写不出来的名字（'$' 不是合法的标识符字符）。
+ * 三段地方要用（匿名 struct、typedef enum、匿名 enum），收成一个函数。 */
+static void make_anon_name(char* out, const char* prefix, int n) {
+    char digits[12];
+    int  k = 0;
+
+    *out++ = '$';
+    while (*prefix) {
+        *out++ = *prefix++;
+    }
+    if (n >= 10) {
+        while (n > 0) {
+            digits[k++] = (char)('0' + n % 10);
+            n /= 10;
+        }
+        while (k > 0) {
+            *out++ = digits[--k];
+        }
+    } else {
+        *out++ = (char)('0' + n);
+    }
+    *out = '\0';
+}
+
 /* 两个类型是不是同一个东西（用来容忍"重复 typedef 同一个类型"） */
 static int same_type(vtype_t a, vtype_t b) {
     if (a.base != b.base || a.ptr != b.ptr || a.ndims != b.ndims ||
@@ -2454,30 +2481,8 @@ static node_t* parse_declaration(int eat_semi) {
                     is_def = 1;
                 }
             } else if (is_punct("{")) {
-                /* 匿名结构体：造一个内部名字（这里没有 stdio，手写十进制） */
-                char* np = sname;
-                int   v  = ++anon_struct_n;
-
-                *np++ = '$';
-                *np++ = 'a';
-                *np++ = 'n';
-                *np++ = 'o';
-                *np++ = 'n';
-                if (v >= 10) {
-                    char digits[12];
-                    int  k = 0;
-
-                    while (v > 0) {
-                        digits[k++] = (char)('0' + v % 10);
-                        v /= 10;
-                    }
-                    while (k > 0) {
-                        *np++ = digits[--k];
-                    }
-                } else {
-                    *np++ = (char)('0' + v);
-                }
-                *np = '\0';
+                /* 匿名结构体：造一个内部名字 */
+                make_anon_name(sname, "anon", ++anon_struct_n);
                 is_def = 1;
             }
             if (is_def) {
@@ -2543,29 +2548,7 @@ static node_t* parse_declaration(int eat_semi) {
                     is_def = 1;
                 }
             } else if (is_punct("{")) {
-                char* np = ename;
-                int   v  = ++anon_struct_n;
-
-                *np++ = '$';
-                *np++ = 'e';
-                *np++ = 'n';
-                *np++ = 'u';
-                *np++ = 'm';
-                if (v >= 10) {
-                    char digits[12];
-                    int  k = 0;
-
-                    while (v > 0) {
-                        digits[k++] = (char)('0' + v % 10);
-                        v /= 10;
-                    }
-                    while (k > 0) {
-                        *np++ = digits[--k];
-                    }
-                } else {
-                    *np++ = (char)('0' + v);
-                }
-                *np = '\0';
+                make_anon_name(ename, "enum", ++anon_struct_n);
                 is_def = 1;
             }
 
@@ -2642,7 +2625,9 @@ static node_t* parse_declaration(int eat_semi) {
     }
 
     /* 先看是不是 "enum Color { ... };" 这种定义（和下面的 struct 一样，
-     * 只看当前 token 分不清定义和 "enum Color c;"，要往后看一个）。 */
+     * 只看当前 token 分不清定义和 "enum Color c;"，要往后看一个）。
+     * 匿名的 `enum { A, B };` 也在这里吃掉 —— 真实代码里非常多
+     * （例如 term.h 的颜色表就是这种写法）。 */
     if (is_kw("enum")) {
         const char* save_p    = lex_p;
         token_t     save_tok  = tok;
@@ -2657,6 +2642,9 @@ static node_t* parse_declaration(int eat_semi) {
             if (is_punct("{")) {
                 is_def = 1;
             }
+        } else if (is_punct("{")) {
+            make_anon_name(ename, "enum", ++anon_struct_n);
+            is_def = 1;
         }
         if (is_def) {
             parse_enum_def(ename, 1);      /* 普通枚举定义：连 ';' 一起吃掉 */
@@ -4516,7 +4504,18 @@ static const char* TYPE_SOURCE =
     "typedef int            bool;\n"
     "typedef unsigned char  byte;\n"
     "typedef unsigned short word;\n"
-    "typedef unsigned int   dword;\n";
+    "typedef unsigned int   dword;\n"
+    /* 标准输入输出的描述符号，以及终端颜色号。
+     * 它们本来在 unistd.h / term.h 里，而这个编译器不看 #include，
+     * 所以内建一份（数值和 user/lib/include 里那两个头文件一致）。
+     * 顺便：这两段也把"匿名 enum 定义"这条路走通了。 */
+    "enum { STDIN_FILENO = 0, STDOUT_FILENO = 1, STDERR_FILENO = 2 };\n"
+    "enum {\n"
+    "    TERM_BLACK = 0, TERM_BLUE, TERM_GREEN, TERM_CYAN, TERM_RED,\n"
+    "    TERM_MAGENTA, TERM_BROWN, TERM_LIGHT_GREY, TERM_DARK_GREY,\n"
+    "    TERM_LIGHT_BLUE, TERM_LIGHT_GREEN, TERM_LIGHT_CYAN,\n"
+    "    TERM_LIGHT_RED, TERM_LIGHT_MAGENTA, TERM_YELLOW, TERM_WHITE\n"
+    "};\n";
 
 /* ============================================================
  * 9b. 自带运行时（用这个子集写的 C 源码） *
@@ -4529,6 +4528,68 @@ static const char* RT_SOURCE =
     "char* rt_heap_base = 0;\n"
     "int rt_heap_used = 0;\n"
     "int rt_heap_have = 0;\n"
+    "\n"
+    "/* ---- 输出出口 ----\n"
+    " * printf / fprintf / vsnprintf 共用同一套格式逻辑，区别只在送到哪儿。\n"
+    " * 这个子集里没有函数指针，所以用一个全局开关：\n"
+    " *   rt_sink_mode 0 = 写文件描述符 rt_sink_fd，1 = 写内存缓冲区。\n"
+    " * print_int / putstr 这些也走 rt_emit，于是 fprintf 才能把整段格式化\n"
+    " * 输出（含 %d %s）送到别的 fd 上去。\n"
+    " */\n"
+    "int   rt_sink_mode = 0;\n"
+    "int   rt_sink_fd   = 1;\n"
+    "char* rt_sink_buf  = 0;\n"
+    "int   rt_sink_cap  = 0;\n"
+    "int   rt_sink_len  = 0;\n"
+    "\n"
+    "void print_int(int v);\n"
+    "void print_uint(int v);\n"
+    "void print_hex(int v);\n"
+    "void putstr(char* s);\n"
+    "\n"
+    "void rt_emit_init(void) {\n"
+    "    rt_sink_mode = 0;\n"
+    "    rt_sink_fd   = 1;\n"
+    "    rt_sink_buf  = 0;\n"
+    "    rt_sink_cap  = 0;\n"
+    "    rt_sink_len  = 0;\n"
+    "}\n"
+    "\n"
+    "void rt_emit(int c) {\n"
+    "    if (rt_sink_mode == 0) {\n"
+    "        char b[2];\n"
+    "        b[0] = (char)c;\n"
+    "        write(rt_sink_fd, b, 1);\n"
+    "    } else {\n"
+    "        if (rt_sink_len < rt_sink_cap - 1) {\n"
+    "            rt_sink_buf[rt_sink_len] = (char)c;\n"
+    "        }\n"
+    "        rt_sink_len = rt_sink_len + 1;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* 格式化的本体；args 指向第一个可变参数 */\n"
+    "void rt_vfmt(char* fmt, int* args) {\n"
+    "    int i = 0;\n"
+    "\n"
+    "    while (fmt[i] != 0) {\n"
+    "        if (fmt[i] != '%') {\n"
+    "            rt_emit(fmt[i]);\n"
+    "            i = i + 1;\n"
+    "            continue;\n"
+    "        }\n"
+    "        i = i + 1;\n"
+    "        if (fmt[i] == 'd') { print_int(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'u') { print_uint(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'x') { print_hex(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 'c') { rt_emit(*args); args = args + 1; }\n"
+    "        else if (fmt[i] == 's') { putstr((char*)*args); args = args + 1; }\n"
+    "        else if (fmt[i] == '%') { rt_emit('%'); }\n"
+    "        else if (fmt[i] == 0) { break; }\n"
+    "        else { rt_emit('%'); rt_emit(fmt[i]); }\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "}\n"
     "\n"
     "int strlen(char* s) {\n"
     "    int n = 0;\n"
@@ -4593,8 +4654,8 @@ static const char* RT_SOURCE =
     "\n"
     "int puts(char* s) {\n"
     "    int i = 0;\n"
-    "    while (s[i] != 0) { putchar(s[i]); i = i + 1; }\n"
-    "    putchar(10);\n"
+    "    while (s[i] != 0) { rt_emit(s[i]); i = i + 1; }\n"
+    "    rt_emit(10);\n"
     "    return 0;\n"
     "}\n"
     "\n"
@@ -4603,14 +4664,14 @@ static const char* RT_SOURCE =
     "    int i = 0;\n"
     "    int neg = 0;\n"
     "    if (v < 0) { neg = 1; v = 0 - v; }\n"
-    "    if (v == 0) { putchar('0'); return; }\n"
+    "    if (v == 0) { rt_emit('0'); return; }\n"
     "    while (v > 0) {\n"
     "        buf[i] = (char)('0' + v % 10);\n"
     "        i = i + 1;\n"
     "        v = v / 10;\n"
     "    }\n"
-    "    if (neg) { putchar('-'); }\n"
-    "    while (i > 0) { i = i - 1; putchar(buf[i]); }\n"
+    "    if (neg) { rt_emit('-'); }\n"
+    "    while (i > 0) { i = i - 1; rt_emit(buf[i]); }\n"
     "}\n"
     "\n"
     "void print_hex(int v) {\n"
@@ -4619,14 +4680,14 @@ static const char* RT_SOURCE =
     "    int u = v;\n"
     "    int left = 0;\n"
     "    if (u < 0) { left = 8; }\n"
-    "    if (u == 0) { putchar('0'); return; }\n"
+    "    if (u == 0) { rt_emit('0'); return; }\n"
     "    while (i < 15 && (u > 0 || left > 0)) {\n"
     "        buf[i] = rt_hexdigits[u & 15];\n"
     "        u = u >> 4;\n"
     "        i = i + 1;\n"
     "        if (left > 0) { left = left - 1; }\n"
     "    }\n"
-    "    while (i > 0) { i = i - 1; putchar(buf[i]); }\n"
+    "    while (i > 0) { i = i - 1; rt_emit(buf[i]); }\n"
     "}\n"
     "\n"
     "void* malloc(int n) {\n"
@@ -4711,20 +4772,20 @@ static const char* RT_SOURCE =
     "\n"
     "void putstr(char* s) {\n"
     "    int i = 0;\n"
-    "    while (s[i] != 0) { putchar(s[i]); i = i + 1; }\n"
+    "    while (s[i] != 0) { rt_emit(s[i]); i = i + 1; }\n"
     "}\n"
     "\n"
     "void print_uint(int v) {\n"
     "    char buf[16];\n"
     "    int i = 0;\n"
     "    if (v < 0) { print_int(v); return; }\n"
-    "    if (v == 0) { putchar('0'); return; }\n"
+    "    if (v == 0) { rt_emit('0'); return; }\n"
     "    while (v > 0 && i < 15) {\n"
     "        buf[i] = (char)('0' + v % 10);\n"
     "        i = i + 1;\n"
     "        v = v / 10;\n"
     "    }\n"
-    "    while (i > 0) { i = i - 1; putchar(buf[i]); }\n"
+    "    while (i > 0) { i = i - 1; rt_emit(buf[i]); }\n"
     "}\n"
     "\n"
     "/* printf：变参是靠从参数在栈上的位置往后数实现的（不能直接写引号，\n"
@@ -4732,33 +4793,91 @@ static const char* RT_SOURCE =
     " * 调用约定是参数从右往左压栈，所以第一个参数在最低地址，\n"
     " * 紧跟其后的字就是第一个可变参数 —— 和 user/lib 里那套是同一个技巧，\n"
     " * 只不过这里是用 hncc 自己编译出来的代码。\n"
-    " * 支持 %d %u %x %c %s %%，返回值恒为 0（不统计字符数）。\n"
+    " * 支持 %d %u %x %c %s %%，返回值是格式化出来的长度。\n"
     " */\n"
     "int printf(char* fmt, ...) {\n"
-    "    int* args;\n"
-    "    int i = 0;\n"
+    "    int* args = &fmt;\n"
     "\n"
-    "    args = &fmt;\n"
     "    args = args + 1;\n"
+    "    rt_emit_init();\n"
+    "    rt_vfmt(fmt, args);\n"
+    "    return rt_sink_len;\n"
+    "}\n"
     "\n"
-    "    while (fmt[i] != 0) {\n"
-    "        if (fmt[i] != '%') {\n"
-    "            putchar(fmt[i]);\n"
-    "            i = i + 1;\n"
-    "            continue;\n"
-    "        }\n"
-    "        i = i + 1;\n"
-    "        if (fmt[i] == 'd') { print_int(*args); args = args + 1; }\n"
-    "        else if (fmt[i] == 'u') { print_uint(*args); args = args + 1; }\n"
-    "        else if (fmt[i] == 'x') { print_hex(*args); args = args + 1; }\n"
-    "        else if (fmt[i] == 'c') { putchar(*args); args = args + 1; }\n"
-    "        else if (fmt[i] == 's') { putstr((char*)*args); args = args + 1; }\n"
-    "        else if (fmt[i] == '%') { putchar('%'); }\n"
-    "        else if (fmt[i] == 0) { break; }\n"
-    "        else { putchar('%'); putchar(fmt[i]); }\n"
-    "        i = i + 1;\n"
-    "    }\n"
+    "/* 和 printf 一样，只是送到指定的文件描述符 */\n"
+    "int fprintf(int fd, char* fmt, ...) {\n"
+    "    int* args = &fmt;\n"
+    "    int  n;\n"
+    "\n"
+    "    args = args + 1;\n"
+    "    rt_emit_init();\n"
+    "    rt_sink_fd = fd;\n"
+    "    rt_vfmt(fmt, args);\n"
+    "    n = rt_sink_len;\n"
+    "    rt_emit_init();\n"
+    "    return n;\n"
+    "}\n"
+    "\n"
+    "int fputs(char* s, int fd) {\n"
+    "    rt_emit_init();\n"
+    "    rt_sink_fd = fd;\n"
+    "    putstr(s);\n"
+    "    rt_emit_init();\n"
     "    return 0;\n"
+    "}\n"
+    "\n"
+    "int fputc(int c, int fd) {\n"
+    "    rt_emit_init();\n"
+    "    rt_sink_fd = fd;\n"
+    "    rt_emit(c);\n"
+    "    rt_emit_init();\n"
+    "    return c;\n"
+    "}\n"
+    "\n"
+    "/* 格式化到缓冲区：最多写 max-1 个字符再补 '\\0'，\n"
+    " * 返回值是**本来想写多少**（和 C 标准一致），这样截断是能看出来的。\n"
+    " * hncc 自己的 fatal() 就是用它拼消息的。 */\n"
+    "int vsnprintf(char* out, int max, char* fmt, int* args) {\n"
+    "    int n;\n"
+    "\n"
+    "    if (max <= 0) { return 0; }\n"
+    "    rt_emit_init();\n"
+    "    rt_sink_mode = 1;\n"
+    "    rt_sink_buf  = out;\n"
+    "    rt_sink_cap  = max;\n"
+    "    rt_vfmt(fmt, args);\n"
+    "    n = rt_sink_len;\n"
+    "    if (n > max - 1) { out[max - 1] = 0; } else { out[n] = 0; }\n"
+    "    rt_emit_init();\n"
+    "    return n;\n"
+    "}\n"
+    "\n"
+    "/* ---- 终端颜色：和 user/lib/src/term.c 用同一套 ANSI 序列 ---- */\n"
+    "\n"
+    "void term_set_fg(int fg) {\n"
+    "    char buf[8];\n"
+    "    int  n = 0;\n"
+    "    int  code;\n"
+    "\n"
+    "    if (fg & 8) { code = 90 + (fg & 7); }\n"
+    "    else        { code = 30 + (fg & 7); }\n"
+    "    buf[n] = (char)0x1B; n = n + 1;\n"
+    "    buf[n] = '[';        n = n + 1;\n"
+    "    if (code >= 100) { buf[n] = (char)('0' + code / 100); n = n + 1; }\n"
+    "    if (code >= 10) { buf[n] = (char)('0' + (code / 10) % 10); n = n + 1; }\n"
+    "    buf[n] = (char)('0' + code % 10); n = n + 1;\n"
+    "    buf[n] = 'm'; n = n + 1;\n"
+    "    write(1, buf, n);\n"
+    "}\n"
+    "\n"
+    "void term_reset(void) {\n"
+    "    char esc[4];\n"
+    "\n"
+    "    esc[0] = (char)0x1B;\n"
+    "    esc[1] = '[';\n"
+    "    esc[2] = '0';\n"
+    "    esc[3] = 'm';\n"
+    "    write(1, esc, 4);\n"
     "}\n";
 
 /* ============================================================
