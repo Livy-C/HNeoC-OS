@@ -145,13 +145,17 @@ $checks = @(
        Expect = @("zero filled at start : yes",
                   "the 512KB array works") },
 
-    # KNOWN-ISSUES #1: an image bigger than the loader's limit used to
-    # triple-fault the VM (a 526KB one is kept in tests\bigdata.c as the
-    # extreme reproducer). The loader now refuses such images instead, and
-    # this check makes sure the refusal stays graceful.
-    # If the bug gets fixed, delete the guard in include/process.h, remove
-    # user/toobig.c, and expect this program to start and print its line.
-    @{ Name = "oversized image is refused, not fatal"; Send = @("toobig");
+    # KNOWN-ISSUES #1: an image past 64KB used to triple-fault the VM while
+    # the loader read it into a kmalloc'd buffer. The loader now stages into
+    # a static BSS buffer, so a ~65KB image loads and runs for real.
+    @{ Name = "a 65KB image loads and runs"; Send = @("toobig");
+       Expect = @("an oversized program image",
+                  "toobig: if you can read this") },
+
+    # ... and an image past the staging buffer (80KB) is still refused with
+    # a plain error instead of a crash.
+    @{ Name = "image past the staging buffer is refused";
+       Send = @("waytoobig");
        Expect = @("program image is too large to load") },
 
     @{ Name = "bigio long I/O";   Send = @("bigio");

@@ -1,16 +1,22 @@
-/* toobig - 镜像刚好超过加载器上限的程序
+/* toobig - 镜像刚好跨过 64KB 的程序
  *
- * 这个程序存在的唯一目的是**验证护栏**：它的镜像是 64KB 的有初值数组，
- * 算下来约 65KB，超过 include/process.h 里的 PROCESS_MAX_LOAD_BYTES
- * （60KB）。加载器应该明确拒绝它，而不是把整机打成三重故障
- * —— 后者是 KNOWN-ISSUES 第 1 节那个还没查清的缺陷的行为。
+ * 这个程序是给 KNOWN-ISSUES 第 1 节那个缺陷做对照的：它的镜像是 64KB 的
+ * 有初值数组，算下来约 65KB —— 正好落在那条"镜像一超过 64KB 加载器就三重
+ * 故障"的线上。
  *
- * 所以期望的输出是启动失败 + "program image is too large to load"，
- * 而不是这个程序真的跑起来打印东西。
+ * 现在的期望输出是**它真的跑起来并打印下面两行**：
+ *
+ *     an oversized program image
+ *     toobig: if you can read this, the size guard is gone
+ *
+ * 加载器改用静态暂存区之后（见 kernel/process.c 的 load_staging），
+ * 65KB 的镜像能正常读完、进程正常创建、程序正常跑到退出；
+ * tools/regress.ps1 里有一条检查盯着这两行输出。
+ * 比暂存区（PROCESS_MAX_LOAD_BYTES）还大的程序由 waytoobig.c 负责测。
  *
  * 注意 main 里必须**真的用到** buf：第一版只声明不用，GCC 直接把整个
- * 数组优化掉了，.lxe 只有 324 字节，护栏根本没被测到 —— 是
- * tools/regress.ps1 里那条检查把它抓出来的。
+ * 数组优化掉了，.lxe 只有 324 字节，什么都没测到 —— 是 regress 里那条
+ * 检查把它抓出来的。
  */
 
 #include <hneoc.h>

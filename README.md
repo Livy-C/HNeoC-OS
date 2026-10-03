@@ -208,7 +208,8 @@ typedef struct {
 | `spin` | `spin.lxe` | 前台死循环，用来验证 Ctrl+C 能把跑飞的程序拉回来 |
 | `bigio` | `bigio.lxe` | 一次写完 2MB，验证长 I/O 期间中断没被关死、写入没被截断 |
 | `bigbss` | `bigbss.lxe` | 512KB 静态数组的 `.bss` 对照：镜像只有几 KB，加载器按 `bss_size` 清零，正常跑完 |
-| `toobig` | `toobig.lxe` | 约 65KB 的镜像，被加载器的 60KB 上限拒绝，用来验证护栏（见 `KNOWN-ISSUES.md`） |
+| `toobig` | `toobig.lxe` | 约 65KB 的镜像：以前一加载就三重故障，现在能正常跑起来（验证 >64KB 那道坎已经过去） |
+| `waytoobig` | `waytoobig.lxe` | 约 96KB 的镜像，超过加载器暂存区（72KB），被明确拒绝而不是崩掉 |
 | `note` | `note.lxe` | 往 notes.txt 追加一行，用来验证数据真的落盘 |
 | `termdemo` | `termdemo.lxe` | term.h 终端 API 示例：固定状态栏 + 滚动区域 + 进度条 |
 | `hpm` | `hpm.lxe` | 包管理器：装/卸/查软件包（见下文） |
@@ -834,7 +835,7 @@ hneoc-os/
 虚拟机要是崩了会立刻停下并指出是哪个检查。
 
 现在有三十多项检查（准确条数用 `regress.ps1 -List` 打印，还在加），覆盖：
-启动横幅与堆范围、512KB 的 bss、超大镜像被加载器拒绝、长 I/O 期间时钟、
+启动横幅与堆范围、512KB 的 bss、65KB 镜像能加载能跑、超出暂存区的镜像被拒绝、长 I/O 期间时钟、
 系统调用边界、用户态异常只杀进程、vi 打开与退出、hpm 的装依赖/运行装出来的
 程序/列文件/校验/卸载、hncc 的编译与产物输出（基础八项、结构体、初始化列表、
 `printf`、`enum`/`switch`、`typedef`/字符串、`typedef` 写法与声明符 七组数字诊断），
@@ -1090,13 +1091,17 @@ $b = New-Object byte[] 4096; $null = $fs.Read($b, 0, 4096)
 - [ ] 信号机制
 - [ ] 更完整的 libc（现在是 `user/lib/` 那一小套：ctype / stdio / stdlib / string / term / unistd）
 - [ ] 用 QEMU + GDB 做源码级调试
-- [ ] **hncc**：真正的预处理器；`hncc.lxe` 自己已经 55KB，离 60KB 的加载
-      上限只剩 5KB，继续加功能之前得先想别的办法（它自己是宿主机 GCC 编的，
-      所以"只发射用到的运行时函数"省不到它头上）
+- [ ] **hncc**：真正的预处理器；`hncc.lxe` 自己已经 56KB，而加载器的暂存区
+      （`PROCESS_MAX_LOAD_BYTES`）是 72KB，还有余量但不算宽裕（hncc 是宿主机
+      GCC 编的，所以"只发射用得到的运行时函数"省不到它头上）
 - [ ] **hpm**：版本比较与 `hpm upgrade`、从 `.hnpkg` 文件离线安装、
       校验和/签名、依赖版本约束
-- [ ] **搞清那个大内存三重故障**（见 `KNOWN-ISSUES.md`；`.bss` 修好之后
-      症状已经变了，需要重新定位）
+- [ ] **加载器不再用暂存区**：先读 40 字节的 LXE 头，按头里的 `size` 建好页框，
+      再把映像直接读进页框（`hneofs_read_at` 本来就是按 512 字节一块读的）。
+      这样省掉一次整块拷贝，镜像上限也从"暂存区大小"抬到"用户区页数"
+- [ ] **搞清堆缓冲区那条路**：拿 `kmalloc` 出来的 64KB+ 内存当读盘目的地会
+      让整机三重故障。已经绕开（加载器改用静态暂存区），根因未定 ——
+      细节和已经排除的解释在 `KNOWN-ISSUES.md` 第 1 节 (5)~(7)
 
 ---
 
