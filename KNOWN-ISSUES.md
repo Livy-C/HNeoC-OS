@@ -216,6 +216,12 @@ panic，并把入口名、当时 esp、返回地址打出来。
 | 局部变量不能和 typedef 名重名 | `user/hncc.c` | `typedef int T;` 之后再写 `int T;`，那个位置会被当成类型名（`is_type_kw()` 把 typedef 名算作类型）。真实代码里少见，所以只在 README 里说明，没做符号表分层 |
 | hpm 不做版本升级 | `user/hpm.c` | `install` 只判断"装没装过"，不比较版本；也没有 `upgrade` |
 | hpm 卸载后留下空目录 | `user/hpm.c` | 只删文件、不删目录（没有 rmdir），会在屏幕上直说 |
+| `exec` 要占一个进程槽 | `kernel/process.c` `process_exec` | 复用普通加载路径的代价：先把新映像装在临时槽里再交换地址空间，所以进程表满（16 个槽）时 exec 会直接失败，而且会消耗一个 pid 号（临时槽拿了一个又立刻归还）。彻底的做法是给 exec 写一条"直接往当前进程里装"的路径 |
+| fork 之后 fd 偏移不共享 | `kernel/process.c` `process_fork` | 每个 fd 一份独立 offset，父子各读各的；真实 Unix 共享同一个 `file` 结构。要共享得先有"打开文件表 + 引用计数"这一层 |
+| fork 出来的孩子接不到 Ctrl+C | `kernel/shell.c` | Ctrl+C 只杀内核 Shell 记着的那个前台进程（在 `process_run` 的等待循环里收）。用户态程序 fork 出来的孩子没人管，跑飞了只能 `kill <pid>` |
+| `wait` 是忙等不是阻塞态 | `kernel/process.c` `process_wait_child` | 等孩子的父进程仍然是 READY，每个时间片都会被调度上去跑一圈 `cpu_halt`。加一个 `PROC_WAITING` 状态、让孩子退出时唤醒父母才是正解（`process_run` 的等待循环同理） |
+| fork 大地址空间会冻结调度 | `kernel/process.c` `process_fork` | 逐页 `memcpy` 整份地址空间是在 `sched_lock` 底下做的（不能关中断，键盘和时钟要活着）。hncc 那种几 MB 的进程 fork 一次，别的任务会停几百毫秒 |
+| 编辑 `.ps1` 会丢掉 BOM | `tools/regress.ps1` 等 | 一些编辑手段（包括按字符串替换的自动改写）重写文件时不保留 UTF-8 BOM。PowerShell 5.1 于是按 GBK 读，中文注释被拆成半个字、甚至吞掉换行，脚本直接语法错误。改完务必用 `[System.IO.File]::ReadAllBytes($p)[0..2]` 确认前三个字节是 `EF BB BF` |
 
 ---
 

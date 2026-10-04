@@ -23,7 +23,15 @@
 #define PROCESS_NAME_MAX   16
 #define PROCESS_MAX        16
 #define PROCESS_KERNEL_STACK_SIZE  (8 * 1024)
-#define PROCESS_MAX_IMAGE_PAGES    768          /* 3MB 上限 */
+/* 一个进程最多占多少页（映像 + bss + 堆，用户栈另算）。
+ *
+ * 用户区一共 4MB = 1024 页，其中 8 页固定给用户栈，所以真实的硬上限是
+ * 1016 页。这里原来写 768（3MB）是随手定的，自举的时候撞上了：
+ * hncc 自己的映像 + bss 是 223 页，剩下的页不够它 malloc 出
+ * "源码缓冲 + 代码缓冲 + 数据缓冲 + 2MB 语法树"（约 2.44MB = 610 页），
+ * 于是报 "out of memory"。现在放开到 1000 页，只留 16 页余量。
+ * 代价是 process_t 里的 image_frames 数组变大（16 个进程 × 4KB = 64KB 内核 BSS）。 */
+#define PROCESS_MAX_IMAGE_PAGES    1000
 #define PROCESS_STACK_PAGES        8            /* 32KB 用户栈 */
 #define PROCESS_NAME_FIELD         16
 #define PROCESS_MAX_FDS            16
@@ -32,7 +40,7 @@
 
 /* 能加载的 .lxe 最大字节数。
  *
- * 结构上的上限是用户区页数：PROCESS_MAX_IMAGE_PAGES * 4KB = 3MB。
+ * 结构上的上限是用户区页数：PROCESS_MAX_IMAGE_PAGES * 4KB ≈ 3.9MB。
  * 这里再压一道 1MB 的策略上限，理由有两条：
  *   - 镜像越大，用户按下回车之后等的时间越长（读 1MB 大约半秒）；
  *   - 有这道上限，"太大了"这条错误路径才有程序能测到（user/waytoobig.c）。
@@ -107,6 +115,22 @@ typedef struct {
     uint32_t  uid;
     bool      admin;             /* 管理员：文件权限检查里按"属主"看待 */
     char      cwd[PROCESS_CWD_MAX];
+
+    /* --- 父子关系 ---
+     * parent_pid 是 fork 时记下的，只有它会用 wait 去收尸。
+     *
+     * no_waiter 表示"这个进程没有等待者"：它由内核 Shell 的 run / spawn
+     * 直接创建，退出之后没人会调 wait，所以槽位随时可以被 alloc_slot 抢走。
+     * fork 出来的孩子正好相反 —— 父母可能还没来得及 wait，槽位就必须留着，
+     * 否则 alloc_slot 会在父母取走 exit_code 之前把槽位抹掉，wait 就永远
+     * 找不到这个 pid 了。
+     *
+     * 父进程先退出时会把孩子过继给 Shell（parent_pid = 0）并置上 no_waiter，
+     * 这样没人管的孩子不会把进程表占死。
+     */
+    uint32_t  parent_pid;
+    bool      no_waiter;
+
     int32_t   exit_code;
     uint32_t  image_size;
     uint32_t  memory_used;       /* 映像 + 用户栈，退出后仍保留供 taskmgr 显示 */
@@ -160,6 +184,33 @@ int process_run(const char* filename, const char* args);
 
 /* 后台启动一个 LXE 程序，立刻返回新进程的 pid；失败返回负数 */
 int process_spawn(const char* filename, const char* args);
+
+/* ------------------------------------------------------------
+ * fork / exec / wait
+ *
+ * 这三个都只在系统调用里用，所以直接收 registers_t*：exec 要改写
+ * 保存的现场，不能只靠返回值。
+ * ------------------------------------------------------------ */
+
+/* 复制当前进程。成功时子进程拿到 pid、父进程拿到子进程的 pid；
+ * 只有内核态任务（进程 0，也就是内核 Shell）不许 fork，返回 -1。
+ * 子进程的内核栈上摆的是父进程现场的一份拷贝，只把 eax 改成 0。
+ */
+int process_fork(registers_t* regs);
+
+/* 用 filename 这个 LXE 覆盖当前进程的映像，保留 pid / fd 表 / 身份 / 工作目录。
+ *
+ * 成功时**不返回** —— 它把 regs 里的 eip / useresp 改成新程序的入口和栈顶，
+ * 于是 isr_common_stub 的 iret 一执行就落在新程序开头，旧程序再也回不来。
+ * 失败返回负的错误码，当前进程原样继续跑（地址空间已经还原）。
+ */
+int process_exec(registers_t* regs, const char* filename, const char* args);
+
+/* 等一个子进程退出并回收它的槽位，退出码写进 *code_out（可为 NULL）。
+ * pid > 0 等指定孩子，pid <= 0 等任意一个孩子。
+ * 返回被回收的子进程 pid；没有这样的孩子返回 -1。
+ */
+int process_wait_child(int32_t pid, int32_t* code_out);
 
 /* 强行结束某个进程。返回 0 成功，负数是各种拒绝原因：
  * -1 没有这个 pid，-2 不能杀 Shell，-3 不能杀自己，-4 已经退出

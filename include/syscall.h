@@ -50,7 +50,17 @@
 #define SYS_CHMOD     25   /* chmod(path, mode) -> 0，失败返回负的错误码 */
 #define SYS_WHOAMI    26   /* whoami() -> uid | (admin << 16) */
 
-#define SYS_COUNT     27
+/* 进程控制。这三个是"用户态 Shell"的地基：
+ * 提示符、内建命令、PATH 查找全都能写成 ring 3 的普通程序。
+ *
+ * fork / exec 和别的系统调用不一样，它们要拿到保存的用户现场 ——
+ * 光靠返回值没法表达"复制一份自己"和"换成另一个程序继续跑"。
+ */
+#define SYS_FORK      27   /* fork() -> 子进程里返回 0，父进程里返回子进程 pid */
+#define SYS_EXEC      28   /* exec(path, args) -> 成功不返回，失败返回负的错误码 */
+#define SYS_WAIT      29   /* wait(pid, status_ptr) -> 被回收的子进程 pid */
+
+#define SYS_COUNT     30
 
 /* 目录遍历的返回值里，用 bit30 表示"这是个目录"。
  *

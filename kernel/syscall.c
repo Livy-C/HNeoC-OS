@@ -19,6 +19,10 @@ static uint32_t total_syscalls = 0;
 /* 定义在后面，sys_read 里要用（fd 0 是标准输入） */
 static int32_t sys_getchar(void);
 
+/* 进程控制（实现在后面，要用 copy_user_string） */
+static int32_t sys_exec(uint32_t path_ptr, uint32_t args_ptr, registers_t* regs);
+static int32_t sys_wait(int32_t pid, uint32_t status_ptr);
+
 uint32_t syscall_total(void) {
     return total_syscalls;
 }
@@ -543,6 +547,61 @@ static int32_t sys_getcwd(uint32_t buf, uint32_t max) {
     return (int32_t)n;
 }
 
+/* ------------------------------------------------------------
+ * fork / exec / wait
+ * ------------------------------------------------------------ */
+
+/* exec：路径和参数都先拷进内核缓冲区再动手。
+ *
+ * 这一步绝不能省。exec 一旦成功，当前进程的地址空间就换成新的了，
+ * 用户空间里那个字符串指针指向的页可能已经还给 PMM 了 —— 内核要是
+ * 还拿着它去开文件，读到的是别人的内容（或者直接踩进没映射的地址）。
+ * 拷成内核缓冲区之后，process_exec 拿着 p 的地址空间翻来覆去都不影响它。
+ */
+static int32_t sys_exec(uint32_t path_ptr, uint32_t args_ptr, registers_t* regs) {
+    char path[128];
+    char args[PROCESS_ARGS_MAX];
+
+    if (!copy_user_string(path_ptr, path, sizeof(path))) {
+        return -1;
+    }
+
+    args[0] = '\0';
+    if (args_ptr != 0 && !copy_user_string(args_ptr, args, sizeof(args))) {
+        return -1;
+    }
+
+    /* 成功的话这里不会返回：process_exec 已经把中断帧改成新程序的入口了 */
+    return (int32_t)process_exec(regs, path, args);
+}
+
+/* wait：等一个子进程退出并回收它。status 写成子进程的退出码。 */
+static int32_t sys_wait(int32_t pid, uint32_t status_ptr) {
+    int32_t code = 0;
+    int rc;
+
+    if (status_ptr != 0 && !user_range_ok(status_ptr, sizeof(int32_t))) {
+        return -1;
+    }
+
+    /* 系统调用门是 interrupt gate，进来时 IF=0；而 process_wait_child
+     * 靠 cpu_halt() 让出 CPU 等孩子退出 —— 关着中断执行 hlt 就是永久停机，
+     * 时钟中断永远进不来，调度器也不会切到那个孩子。
+     * 所以和 sys_getchar / sys_sleep 一样，阻塞等待必须临时打开中断。 */
+    enable_interrupts();
+    rc = process_wait_child(pid, &code);
+    disable_interrupts();
+
+    if (rc < 0) {
+        return -1;
+    }
+
+    if (status_ptr != 0) {
+        *(int32_t*)status_ptr = code;
+    }
+    return rc;
+}
+
 static int32_t sys_getchar(void) {
     int32_t c;
 
@@ -834,6 +893,19 @@ void syscall_handler(registers_t* regs) {
 
         case SYS_SBRK:
             ret = sys_sbrk((int32_t)regs->ebx);
+            break;
+
+        case SYS_FORK:
+            ret = process_fork(regs);
+            break;
+
+        case SYS_EXEC:
+            /* 注意：成功时它不返回，regs 已经被改成新程序的入口了 */
+            ret = sys_exec(regs->ebx, regs->ecx, regs);
+            break;
+
+        case SYS_WAIT:
+            ret = sys_wait((int32_t)regs->ebx, regs->ecx);
             break;
 
         default:

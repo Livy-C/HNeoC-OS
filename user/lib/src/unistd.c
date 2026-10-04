@@ -111,6 +111,26 @@ void yield(void) {
     (void)__syscall0(SYS_YIELD);
 }
 
+/* ---- fork / exec / wait ---- */
+
+int fork(void) {
+    return (int)__syscall0(SYS_FORK);
+}
+
+int exec(const char* path, const char* args) {
+    /* 成功的话内核不会回到这儿：它把返回的现场改成了新程序的入口，
+     * 所以这个函数的返回值只有一种情况会出现 —— 失败。 */
+    return (int)__syscall2(SYS_EXEC, (int32_t)path, (int32_t)args);
+}
+
+int waitpid(int pid, int* status) {
+    return (int)__syscall2(SYS_WAIT, pid, (int32_t)status);
+}
+
+int wait(int* status) {
+    return waitpid(-1, status);
+}
+
 /* ---- 终端输入 ---- */
 
 int getkey(void) {

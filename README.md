@@ -5,8 +5,9 @@
 **当前版本：0.3.0**
 
 它已经不是一个玩具 Demo 了：有物理内存管理、分页、ATA 磁盘驱动、自己的文件
-系统、ring 3 用户态、系统调用、抢占式多任务调度、多用户账户与文件权限，
-以及一个任务管理器。Shell 里的每条命令都是磁盘上一个独立的可执行文件。
+系统、ring 3 用户态、系统调用、`fork` / `exec` / `wait`、抢占式多任务调度、
+多用户账户与文件权限，以及一个任务管理器。Shell 里的每条命令都是磁盘上一个
+独立的可执行文件。
 
 ```
 login: root
@@ -215,6 +216,7 @@ typedef struct {
 | `termdemo` | `termdemo.lxe` | term.h 终端 API 示例：固定状态栏 + 滚动区域 + 进度条 |
 | `hpm` | `hpm.lxe` | 包管理器：装/卸/查软件包（见下文） |
 | `hncc` | `hncc.lxe` | C 编译器：把 `.c` 直接编成能跑的 `.lxe`（见下文） |
+| `forktest` | `forktest.lxe` | `fork` / `exec` / `wait` 全套自检；`forktest stress 30` 是泄漏压测 |
 
 ### vi：一个能用的全屏编辑器
 
@@ -660,8 +662,11 @@ DPL=3 让 ring 3 能调用；interrupt gate 会清 IF，避免系统调用返回
 | 24 | `getcwd(buf, max)` | 取当前工作目录 |
 | 25 | `chmod(path, mode)` | 改权限位（装包要靠它补执行位） |
 | 26 | `whoami()` | 返回 `uid \| (admin << 16)`，用户态用 `getuid()` / `is_admin()` 拆开 |
+| 27 | `fork()` | 复制当前进程：子进程返回 0，父进程返回子进程 pid |
+| 28 | `exec(path, args)` | 换成另一个程序继续跑（成功不返回） |
+| 29 | `wait(pid, status_ptr)` | 等子进程退出并回收它 |
 
-一共 27 个，调用号在 `include/syscall.h` 和用户态的
+一共 30 个，调用号在 `include/syscall.h` 和用户态的
 `user/lib/include/hneoc.h` 里各定义一份，**加调用时必须两边一起改**；
 两边重复的只有这些编号本身，`SYS_COUNT` 只在 `include/syscall.h` 里有。
 
@@ -670,6 +675,84 @@ fd 0/1/2 固定映射到控制台，其余从 3 开始分配，每个进程一�
 
 用户态运行时在 `user/lib/`（`include/` 头文件 + `src/` 实现：ctype、stdio、
 stdlib、string、term、unistd），是一套自己写的极简 libc，不是只有头文件的壳。
+
+### fork / exec / wait
+
+这三个系统调用是"用户态 Shell"的地基：有了它们，提示符、内建命令、PATH 查找
+全都能写成 ring 3 的普通程序，而不是内核里的一个 `switch`。它们和别的调用
+最不一样的地方是**光靠返回值表达不了自己的语义**，所以内核直接拿到
+`registers_t*`（保存的用户现场），而不是只收几个整数参数。
+
+```c
+int pid = fork();
+if (pid == 0) {
+    exec("/bin/hello.lxe", "");   /* 只有失败才会走到下一行 */
+    exit(1);
+}
+int status;
+waitpid(pid, &status);
+```
+
+**fork** 做的事就是把父进程整个复制一份：
+
+| 复制什么 | 怎么复制 |
+|----------|----------|
+| 映像页 + 堆页 | 一页一页 `pmm_alloc_page` 再 `memcpy`，映射到同样的虚地址 |
+| 用户栈 | 同上，8 页 |
+| fd 表 | 整份 `memcpy`（见下面的"注意"） |
+| uid / admin / 工作目录 / 命令行参数 | 直接继承 |
+| 内核栈上的中断帧 | 把父进程此刻那份 `int 0x80` 帧照抄到子进程内核栈顶，只把 `eax` 改成 0 |
+
+最后一条就是 fork 的全部奥义：子进程从系统调用返回之后，看到的是
+"同一条指令、同一个用户栈、同一批寄存器"，唯独 `fork()` 的返回值是 0，
+而父进程拿到的是子进程的 pid。帧正好 64 字节（`registers_t` 是 16 个
+dword），摆在子进程内核栈顶，`isr_common_stub` 的 `popa` / `iret` 弹完
+之后 `esp` 刚好落回栈顶。
+
+**exec** 不是"新建一个进程"，而是把当前进程的映像换掉，pid / fd 表 /
+uid / 工作目录全部保留。实现上复用了普通加载路径：先按"新建进程"的样子
+把新映像装在一个**临时槽**里（`load_program_locked`），成功之后把两个
+进程的地址空间整个对调，再拆掉临时槽里那份旧地址空间。这样做的好处是
+查找文件、校验头、分页、分块读正文一行都不用重写。
+
+装完之后它**改写中断帧**而不是返回一个值：`eip` 指向新程序入口、
+`useresp` 指向新栈顶、其余寄存器清零。`isr_handler` 返回后
+`isr_common_stub` 的 `popa` / `iret` 就把控制权交给新程序了 —— 旧程序
+再也回不来，这正是 exec 的语义。
+
+**wait** 从被等进程的槽位读出 `exit_code`，然后把槽位还回去。等待期间靠
+`cpu_halt()` 让出 CPU。注意系统调用门是 interrupt gate，进来时 IF=0，
+所以 `sys_wait` 和 `sys_getchar` / `sys_sleep` 一样得**自己临时打开中断** ——
+关着中断执行 `hlt` 就是永久停机，时钟中断永远进不来。
+
+#### 僵尸槽位不能被抢走
+
+这条路线上最容易踩的坑是"父母还没来得及 wait，孩子的槽位就被复用掉了"。
+`alloc_slot()` 在进程表满的时候会回收僵尸，一旦它把一个还没被 wait 的
+僵尸抹掉，父进程就会永远等一个再也看不见的 pid。所以：
+
+- `process_t` 里有一个 `no_waiter` 标志。内核 Shell 用 `run` / `spawn`
+  直接拉起来的进程，退出后没人 wait，随时可以回收（`no_waiter = true`）；
+  `fork` 出来的孩子相反，槽位必须留到父母 wait 为止。
+- 父进程先退出时 `reparent_children()` 把孩子过继给 Shell（pid 0）并
+  置上 `no_waiter` —— 相当于 Unix 把孤儿挂到 init 底下，没人管的孩子
+  不会把进程表占死。
+- `process_wait_child` 回收槽位时必须关中断：否则时钟中断可以插在
+  "释放内核栈"和"标记 UNUSED"中间，`reap_zombies` 会对同一个指针再释放
+  一次。`process_run` 结尾那段用的是同一个套路。
+
+#### 两点和 Unix 不一样的地方
+
+- **fd 的偏移不共享**。真实 Unix 里 fork 之后父子的文件偏移指向同一个
+  `file` 结构；这里每个 fd 一份独立的 offset，父子各读各的。因为内核里
+  没有"打开文件表"那一层，要共享就得引入引用计数 —— 对"fork 完马上 exec"
+  这种用法没有区别，先按简单的来。
+- **exec 会消耗一个 pid**（临时槽占了一个槽位和一个 pid 号），而且进程表
+  满的时候 exec 会直接失败。这是"复用加载路径"换来的代价。
+
+`forktest` 是这三个调用的自检程序，`forktest stress 30` 则是泄漏压测：
+反复 fork / malloc / exit / wait，进程表只有 16 个槽，任何一处漏了
+十来轮之内就会失败。
 
 ### 控制台支持 ANSI 转义序列
 
@@ -1080,6 +1163,13 @@ $b = New-Object byte[] 4096; $null = $fs.Read($b, 0, 4096)
     字符会把换行一起吃掉（一行行注释被合并成一行）。处理这类文件要用
     .NET 的 `[System.IO.File]::ReadAllText($p, (New-Object System.Text.UTF8Encoding($false)))`。
     改完脚本记得跑 `tools/fix-bom.ps1`。
+    补充一条更容易中招的：**丢 BOM 不需要你去用 `Set-Content`** ——
+    任何"重写整个文件"的编辑手段（包括按字符串替换的那种）都可能顺手
+    把 BOM 一起丢掉，症状就是脚本突然报一串莫名其妙的语法错误。
+    `tools/regress.ps1` 就这么中过一次：只往自己的测试表里插了几行，
+    BOM 没了，PowerShell 按 GBK 一读，中文注释吃掉换行，报的是
+    `Missing expression after ','`。所以改完 `.ps1` 一定顺手确认
+    `[System.IO.File]::ReadAllBytes($p)[0..2]` 是 `EF BB BF`。
 
 34. **系统盘满会让编译器以一个看不懂的理由失败**：GCC 的中间文件默认写到
     系统 `%TEMP%`，盘一满就报 `error writing to ...s: No space left on device`，
@@ -1087,11 +1177,25 @@ $b = New-Object byte[] 4096; $null = $fs.Read($b, 0, 4096)
     `TMP`/`TEMP` 指到项目自己的 `build\tmp\`，构建不再受系统盘剩余空间
     影响（这条也是真踩过：C 盘只剩 10MB 时整个构建挂了）。
 
+35. **在系统调用里 `hlt` 等待之前，必须先把中断打开**。系统调用门是
+    interrupt gate，进门时 IF 已经被硬件清零；这时如果调用路径上有
+    `cpu_halt()`（比如 `wait` 用 `hlt` 让出 CPU 等子进程），机器就是**永久
+    停机**：时钟中断永远进不来，调度器不会切到那个子进程，父进程也再也
+    醒不过来。现象特别有迷惑性 —— 串口日志停在父进程最后一行输出，
+    `VBoxManage` 报虚拟机还在 `running`，既不崩机也不报错，看起来像死锁
+    又像卡住。`sys_getchar` 和 `sys_sleep` 一开始就是这么写的（它们自己
+    `enable_interrupts()` / `disable_interrupts()`），新加的 `sys_wait`
+    漏了这一步，于是第一次 `forktest` 就撞上了。**加任何会阻塞的系统调用，
+    先翻一眼这条。**
+
 ---
 
 ## 下一步可以做什么
 
 - [ ] 阻塞式 `wait()`，让父进程真正睡眠而不是忙等
+- [ ] **把 Shell 从内核搬到 ring 3**：`fork` / `exec` / `wait` 已经就位，
+      剩下的是把 `kernel/shell.c` 里的提示符、输入行编辑、命令表、
+      PATH 查找改写成 `user/sh.c`，内核只留一个最小的 `init` 去拉起它
 - [ ] 每个进程独立的用户区大小（现在固定 4MB）
 - [ ] 用户组与更细的权限（现在只有属主 / 其他人两组）
 - [ ] `su` / 修改自己的口令 / 把口令哈希换成带盐的（现在 djb2 无盐）

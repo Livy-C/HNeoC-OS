@@ -177,6 +177,19 @@ $checks = @(
     @{ Name = "fault kills only the process"; Send = @("fault");
        Expect = @("killed: Page Fault") },
 
+    # fork / exec / wait：整套自检跑完必须打最后那句，中途任何一条 FAIL
+    # 都会让 Expect 失配。分开写三条是为了能在日志里一眼看出卡在哪一节。
+    @{ Name = "fork + waitpid + address space split"; Send = @("forktest");
+       Expect = @("\[parent\] reaped pid=\d+, exit=7", "ok: fork \+ waitpid",
+                  "marker=999") },
+
+    @{ Name = "fork/exec/wait selftest completes"; Send = @();
+       Expect = @("ok: heap copy", "ok: exec \(the child kept pid \d+",
+                  "== all fork/exec/wait tests passed ==") },
+
+    @{ Name = "fork/wait leak stress"; Send = @("forktest stress 30");
+       Expect = @("ok: 30 fork/wait rounds, nothing leaked") },
+
     @{ Name = "vi opens a file";  Send = @("vi /share/hncc/hello.c");
        Expect = @("NORMAL") },
 

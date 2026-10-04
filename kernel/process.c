@@ -177,6 +177,27 @@ static void free_user_resources(process_t* p) {
     p->stack_pages = 0;
 }
 
+/* 父进程没了：把孩子过继给内核 Shell（pid 0），并允许 alloc_slot 回收它们。
+ *
+ * 不过继的话，fork 出来的孩子在父母死后就成了没人 wait 的僵尸 ——
+ * no_waiter 还是 false，alloc_slot 不敢动它，那 4KB 的 process_t 槽位
+ * 就永远占着了。过继 + 置 no_waiter 之后，孤儿退出时能被正常回收，
+ * 相当于 Unix 把孤儿挂到 init 底下。
+ */
+static void reparent_children(uint32_t dying_pid) {
+    for (uint32_t i = 1; i < PROCESS_MAX; i++) {
+        process_t* p = &processes[i];
+
+        if (p->state == PROC_UNUSED) {
+            continue;
+        }
+        if (p->parent_pid == dying_pid) {
+            p->parent_pid = 0;
+            p->no_waiter  = true;
+        }
+    }
+}
+
 /* 找一个空槽。没有空槽就回收最老的僵尸。 */
 static process_t* alloc_slot(void) {
     for (uint32_t i = 1; i < PROCESS_MAX; i++) {
@@ -185,9 +206,16 @@ static process_t* alloc_slot(void) {
         }
     }
 
-    /* 全都占着，挑一个僵尸回收掉 */
+    /* 全都占着，挑一个僵尸回收掉。
+     *
+     * 只动 no_waiter 的僵尸：fork 出来的孩子即使已经退出，它的父进程也可能
+     * 还没调 wait。槽位在这儿被 memset 掉的话，wait 就永远找不到那个 pid 了
+     * —— 父母会一直等一个再也看不见的孩子。
+     */
     for (uint32_t i = 1; i < PROCESS_MAX; i++) {
-        if (processes[i].state == PROC_ZOMBIE && processes[i].kernel_stack == NULL) {
+        if (processes[i].state == PROC_ZOMBIE &&
+            processes[i].kernel_stack == NULL &&
+            processes[i].no_waiter) {
             memset(&processes[i], 0, sizeof(process_t));
             processes[i].index = i;
             processes[i].state = PROC_UNUSED;
@@ -272,6 +300,11 @@ static process_t* create_from_header_locked(const char* filename,
     p->is_user = true;
     p->start_tick = timer_get_ticks();
     total_created++;
+
+    /* run / spawn 直接建出来的进程没有等待者：退出之后槽位随时可以回收。
+     * fork 出来的孩子走的不是这条路（见 process_fork），它们要留给父母 wait。 */
+    p->parent_pid = current ? current->pid : 0;
+    p->no_waiter  = true;
 
     /* 身份和工作目录从创建者那里继承：Shell 是 root 时子程序也是 root，
      * 普通用户跑的程序同理 —— 系统调用里的权限检查就靠这个 uid。 */
@@ -427,8 +460,15 @@ static bool fill_image_pages(process_t* p, const hneofs_file_t* f,
     return true;
 }
 
-/* 从文件系统读出一个 LXE 并创建进程 */
-static process_t* load_program(const char* filename, const char* args, int* err) {
+/* 从文件系统读出一个 LXE 并创建进程。
+ *
+ * **调用者必须已经拿着 sched_lock**（理由见 include/process.h 里 sched_lock
+ * 那一段）：骨架一建好，新任务就是 PROC_READY 了，正文却还没读进来 ——
+ * 这时候被切上去跑，跑的就是一个读到一半的程序。
+ * fork 和 exec 都得在这把锁底下建任务，所以这里拆成"不锁"的核心，
+ * 外面由 load_program 包一层锁。
+ */
+static process_t* load_program_locked(const char* filename, const char* args, int* err) {
     const hneofs_file_t* f;
     lxe_header_t hdr;
     process_t* p;
@@ -471,14 +511,6 @@ static process_t* load_program(const char* filename, const char* args, int* err)
         return NULL;
     }
 
-    /* 骨架 + 正文都在这一段里做完，期间用 sched_lock 挡住任务切换。
-     *
-     * 为什么不是关中断：读正文是几十毫秒的磁盘 I/O，关中断会把键盘和时钟
-     * 一起冻住。而骨架建完时新任务已经是 PROC_READY 了，只是正文还没读进去
-     * —— 这时候要是被切上去跑，跑的就是一个读到一半的程序。sched_lock 正好
-     * 是"中断照进、但不换任务"，和 sys_readfile 里那段用的是同一个办法。
-     */
-    sched_lock();
     p = create_from_header_locked(filename, &hdr, err);
     if (p) {
         if (fill_image_pages(p, f, hdr.size)) {
@@ -493,13 +525,28 @@ static process_t* load_program(const char* filename, const char* args, int* err)
             *err = -4;
         }
     }
-    sched_unlock();
 
     if (!p) {
         return NULL;
     }
 
     *err = 0;
+    return p;
+}
+
+/* load_program_locked 的加锁外壳。
+ *
+ * 为什么不是关中断：读正文是几十毫秒的磁盘 I/O，关中断会把键盘和时钟
+ * 一起冻住。sched_lock 是"中断照进、但不换任务"，
+ * 和 sys_readfile 里那段用的是同一个办法。
+ */
+static process_t* load_program(const char* filename, const char* args, int* err) {
+    process_t* p;
+
+    sched_lock();
+    p = load_program_locked(filename, args, err);
+    sched_unlock();
+
     return p;
 }
 
@@ -772,6 +819,9 @@ void process_exit_current(int32_t code) {
     p->exit_code = code;
     p->end_tick  = timer_get_ticks();
 
+    /* 孩子过继给 Shell —— 我们马上就不在了，没人再会 wait 它们 */
+    reparent_children(p->pid);
+
     /* 用户资源可以立刻释放：反正不会再回到那个地址空间了。
      * 内核栈不行 —— 我们此刻正踩在它上面，交给 reap_zombies 稍后回收。
      */
@@ -858,6 +908,366 @@ int process_spawn(const char* filename, const char* args) {
     return (int)p->pid;
 }
 
+/* ------------------------------------------------------------
+ * fork / exec / wait
+ * ------------------------------------------------------------ */
+
+/* exec 交换地址空间时用的中转缓冲。
+ *
+ * 放 BSS 而不是栈上：image_frames 有 4KB，而用户进程的内核栈一共才 8KB，
+ * 在栈上摆一个 4KB 的临时数组再叠上调用链很容易砸穿栈底
+ * （当年 hneofs_sync 就是这么撞出 __chkstk_ms 的）。
+ * 同一时刻只可能有一个进程在 exec 里，所以静态变量是安全的。
+ */
+static uint32_t swap_frames[PROCESS_MAX_IMAGE_PAGES];
+static uint32_t swap_stack[PROCESS_STACK_PAGES];
+
+/* 把 a 和 b 的用户地址空间整个对调。
+ * 交换之后 a 拿的是 b 原来那套映像，反之亦然。CR3 由调用者自己刷 ——
+ * 这个函数只动 process_t 里的字段。
+ */
+static void swap_address_space(process_t* a, process_t* b) {
+    uint32_t a_pages = a->image_pages + a->heap_pages;
+    uint32_t b_pages = b->image_pages + b->heap_pages;
+    uint32_t a_stack = a->stack_pages;
+    uint32_t b_stack = b->stack_pages;
+    uint32_t  t;
+    uint32_t* tp;
+
+    t = a->page_directory;  a->page_directory  = b->page_directory;  b->page_directory  = t;
+    t = a->image_size;      a->image_size      = b->image_size;      b->image_size      = t;
+    t = a->memory_used;     a->memory_used     = b->memory_used;     b->memory_used     = t;
+    t = a->heap_start;      a->heap_start      = b->heap_start;      b->heap_start      = t;
+    t = a->heap_end;        a->heap_end        = b->heap_end;        b->heap_end        = t;
+    t = a->user_stack_base; a->user_stack_base = b->user_stack_base; b->user_stack_base = t;
+    t = a->entry;           a->entry           = b->entry;           b->entry           = t;
+    t = a->user_stack_top;  a->user_stack_top  = b->user_stack_top;  b->user_stack_top  = t;
+    t = a->image_pages;     a->image_pages     = b->image_pages;     b->image_pages     = t;
+    t = a->heap_pages;      a->heap_pages      = b->heap_pages;      b->heap_pages      = t;
+    t = a->stack_pages;     a->stack_pages     = b->stack_pages;     b->stack_pages     = t;
+
+    tp = a->user_table;     a->user_table      = b->user_table;      b->user_table      = tp;
+
+    /* 页框数组。两边的条数通常不一样（新映像一般和旧的大小不同），
+     * 所以各自按交换前的条数搬：先把 a 的挪进中转区，再把 b 的搬给 a，
+     * 最后把中转区里的搬给 b。 */
+    memcpy(swap_frames, a->image_frames, a_pages * sizeof(uint32_t));
+    memcpy(a->image_frames, b->image_frames, b_pages * sizeof(uint32_t));
+    memcpy(b->image_frames, swap_frames, a_pages * sizeof(uint32_t));
+
+    memcpy(swap_stack, a->stack_frames, a_stack * sizeof(uint32_t));
+    memcpy(a->stack_frames, b->stack_frames, b_stack * sizeof(uint32_t));
+    memcpy(b->stack_frames, swap_stack, a_stack * sizeof(uint32_t));
+}
+
+int process_fork(registers_t* regs) {
+    process_t* parent = current;
+    process_t* child;
+    uint32_t total_image;
+
+    if (!parent || !parent->is_user || !parent->page_directory) {
+        return -1;   /* 内核态任务（进程 0）没有用户地址空间可复制 */
+    }
+
+    /* 复制一整份地址空间，期间不能让别的任务插进来碰 PMM 和内核堆。
+     * sched_lock 只是"不换任务"，中断照进，键盘和时钟都不受影响。 */
+    sched_lock();
+
+    child = alloc_slot();
+    if (!child) {
+        sched_unlock();
+        return -5;   /* 进程表满了 */
+    }
+
+    memset(child, 0, sizeof(process_t));
+    child->index      = (uint32_t)(child - processes);
+    child->pid        = next_pid++;
+    child->state      = PROC_UNUSED;   /* 全部建完才置 READY */
+    child->is_user    = true;
+    child->start_tick = timer_get_ticks();
+    total_created++;
+
+    strncpy(child->name, parent->name, PROCESS_NAME_MAX - 1);
+    child->uid        = parent->uid;
+    child->admin      = parent->admin;
+    child->parent_pid = parent->pid;
+    child->no_waiter  = false;   /* 父母会 wait，槽位得留到那时候 */
+    strncpy(child->cwd, parent->cwd, PROCESS_CWD_MAX - 1);
+    memcpy(child->args, parent->args, PROCESS_ARGS_MAX);
+
+    /* fd 表整份复制。
+     *
+     * 真实 Unix 里 fork 之后父子的文件偏移是共享的（同一个 file 结构）；
+     * 这里每个 fd 一份独立的 offset，父子各读各的。因为内核里没有
+     * "打开文件表"那一层，要共享就得引入引用计数 —— 对 Shell 这种
+     * "fork 完马上 exec"的用法没有区别，先按简单的来。
+     */
+    memcpy(child->fds, parent->fds, sizeof(parent->fds));
+
+    /* --- 内核栈 --- */
+    child->kernel_stack = (uint8_t*)kmalloc(PROCESS_KERNEL_STACK_SIZE);
+    if (!child->kernel_stack) {
+        fail_create(child);
+        sched_unlock();
+        return -3;
+    }
+    memset(child->kernel_stack, 0, PROCESS_KERNEL_STACK_SIZE);
+    child->kernel_stack_size = PROCESS_KERNEL_STACK_SIZE;
+    child->kernel_stack_top  = (uint32_t)child->kernel_stack + PROCESS_KERNEL_STACK_SIZE;
+
+    /* --- 页目录与页表 --- */
+    child->page_directory = (uint32_t)paging_create_directory();
+    child->user_table     = paging_create_user_table();
+    if (!child->page_directory || !child->user_table) {
+        fail_create(child);
+        sched_unlock();
+        return -3;
+    }
+    paging_attach_user_table((uint32_t*)child->page_directory, child->user_table);
+
+    /* --- 映像页 + 堆页：整份复制 ---
+     * 两类页在 image_frames[] 里是连着的，所以一个循环走完。 */
+    total_image = parent->image_pages + parent->heap_pages;
+    for (uint32_t i = 0; i < total_image; i++) {
+        void* frame = pmm_alloc_page();
+
+        if (!frame) {
+            fail_create(child);
+            sched_unlock();
+            return -3;
+        }
+
+        child->image_frames[i] = (uint32_t)frame;
+        /* 这一步兼作"已经复制了几页"的记账：中途失败时 fail_create 靠
+         * image_pages 决定释放多少页框，记少了就漏、记多了就误释放别人的页。 */
+        child->image_pages = i + 1;
+
+        memcpy(frame, (const void*)parent->image_frames[i], PAGE_SIZE);
+
+        if (!paging_map_user_page(child->user_table, USER_BASE + i * PAGE_SIZE,
+                                  (uint32_t)frame, true)) {
+            fail_create(child);
+            sched_unlock();
+            return -3;
+        }
+    }
+    /* 复制完才把两个计数还原成各自的真值：页框连着放，记账是分开的 */
+    child->image_pages = parent->image_pages;
+    child->heap_pages  = parent->heap_pages;
+
+    /* --- 用户栈：同样整份复制 --- */
+    for (uint32_t i = 0; i < parent->stack_pages; i++) {
+        void* frame = pmm_alloc_page();
+
+        if (!frame) {
+            fail_create(child);
+            sched_unlock();
+            return -3;
+        }
+
+        child->stack_frames[i] = (uint32_t)frame;
+        child->stack_pages = i + 1;
+        memcpy(frame, (const void*)parent->stack_frames[i], PAGE_SIZE);
+
+        if (!paging_map_user_page(child->user_table,
+                                  USER_BASE + USER_REGION_SIZE
+                                            - (PROCESS_STACK_PAGES - i) * PAGE_SIZE,
+                                  (uint32_t)frame, true)) {
+            fail_create(child);
+            sched_unlock();
+            return -3;
+        }
+    }
+
+    /* 堆和栈的边界、入口地址直接继承 —— 地址空间是逐字节复制出来的，
+     * 虚地址布局当然一模一样，连 sbrk 记到哪儿了都一致。 */
+    child->heap_start      = parent->heap_start;
+    child->heap_end        = parent->heap_end;
+    child->user_stack_base = parent->user_stack_base;
+    child->entry           = parent->entry;
+    child->user_stack_top  = parent->user_stack_top;
+    child->image_size      = parent->image_size;
+    child->memory_used     = parent->memory_used;
+
+    /* --- 子进程的初始现场 ---
+     *
+     * 就是把父进程此刻这份 int 0x80 的中断帧照抄一份，只把 eax 改成 0。
+     * 子进程从系统调用返回之后看到的和父进程完全一样：同一条指令、
+     * 同一个用户栈、同一批寄存器 —— 唯独 fork() 的返回值是 0，
+     * 而父进程那边拿到的是下面返回的这个 pid。这就是 fork 的全部奥义。
+     *
+     * 栈顶那 64 字节正好放得下一整帧（registers_t 就是 16 个 dword），
+     * isr_common_stub 的 popa / iret 会把它弹干净，esp 刚好落回栈顶。
+     */
+    {
+        registers_t* frame = (registers_t*)(child->kernel_stack_top - sizeof(registers_t));
+
+        memcpy(frame, regs, sizeof(registers_t));
+        frame->eax = 0;
+        child->esp = (uint32_t)frame;
+    }
+
+    child->state = PROC_READY;
+    sched_unlock();
+
+    return (int)child->pid;
+}
+
+int process_exec(registers_t* regs, const char* filename, const char* args) {
+    process_t* p = current;
+    process_t* tmp;
+    char name[PROCESS_NAME_MAX];
+    char newargs[PROCESS_ARGS_MAX];
+    int err = 0;
+
+    if (!p || !p->is_user) {
+        return -1;   /* 内核态任务没有用户映像可以替换 */
+    }
+
+    /* 先按"新建一个进程"的路子把新映像装在临时槽里。
+     *
+     * 这样查找文件、校验头、分配页框、分块读正文全都复用 load_program，
+     * 一行都不用重写；代价是要有一个空槽，进程表满了 exec 就失败。
+     * load_program_locked 而不是 load_program：锁必须从这儿一直拿到底，
+     * 中间松手的话调度器可能切到临时槽里那个还等着被换掉的进程。
+     */
+    sched_lock();
+
+    tmp = load_program_locked(filename, args, &err);
+    if (!tmp) {
+        sched_unlock();
+        return err;
+    }
+
+    /* 新程序的程序名和命令行参数先抄出来：下面一交换，tmp 手里就是旧映像了，
+     * 而这两个字段我们要写到 p 身上（p 才是活下来的那个进程）。 */
+    memcpy(name, tmp->name, PROCESS_NAME_MAX);
+    memcpy(newargs, tmp->args, PROCESS_ARGS_MAX);
+
+    swap_address_space(p, tmp);
+
+    memcpy(p->name, name, PROCESS_NAME_MAX);
+    memcpy(p->args, newargs, PROCESS_ARGS_MAX);
+
+    /* CR3 必须紧跟着换：p 的页目录指针变了，但 CPU 里那个还是旧的 ——
+     * 也就是刚归到临时槽名下、马上就要被拆掉的那一张。
+     * 顺序不能颠倒，先刷 CR3 再释放旧页目录，否则 PMM 可能把那几页
+     * 重新分配出去，而 CR3 还指着它们。 */
+    paging_switch_directory(p->page_directory);
+
+    /* 旧映像连同它的页框、页表、页目录一起还给 PMM。
+     * 此刻它们挂在临时槽名下，所以直接拆临时槽就行。 */
+    free_user_resources(tmp);
+
+    /* 临时槽的内核栈是 load_program_locked 刚分配的，我们没跑在上面，
+     * 可以直接释放，然后把槽位还回去。 */
+    if (tmp->kernel_stack) {
+        kfree(tmp->kernel_stack);
+        tmp->kernel_stack = NULL;
+    }
+    memset(tmp, 0, sizeof(process_t));
+    tmp->index = (uint32_t)(tmp - processes);
+    tmp->state = PROC_UNUSED;
+
+    sched_unlock();
+
+    /* 改写返回到用户态的现场。
+     *
+     * 这里是 exec 和别的系统调用最不一样的地方：它不是"返回一个值"，
+     * 而是把整份中断帧改成"一个全新的进程正要从入口点开始跑"的样子。
+     * isr_handler 返回之后，isr_common_stub 的 popa / iret 就把控制权
+     * 交给新程序了 —— 旧程序再也回不来，这正是 exec 的语义。
+     *
+     * eflags / cs / ss 保持原样：它们本来就是这个进程的用户态选择子和
+     * 开着中断的标志位，而新老程序跑的是同一个 ring 3。
+     */
+    regs->edi = 0;
+    regs->esi = 0;
+    regs->ebp = 0;
+    regs->esp = 0;          /* pusha 的槽位，popa 时被忽略 */
+    regs->ebx = 0;
+    regs->edx = 0;
+    regs->ecx = 0;
+    regs->eax = 0;
+    regs->eip     = p->entry;
+    regs->useresp = p->user_stack_top;
+
+    return 0;
+}
+
+int process_wait_child(int32_t pid, int32_t* code_out) {
+    process_t* me = current;
+    process_t* child;
+    uint32_t child_pid;
+    int32_t  code;
+
+    if (!me) {
+        return -1;
+    }
+
+    for (;;) {
+        child = NULL;
+
+        /* 找一个符合条件的孩子：pid > 0 是指定等谁，pid <= 0 是等任意一个。 */
+        for (uint32_t i = 1; i < PROCESS_MAX; i++) {
+            process_t* p = &processes[i];
+
+            if (p->state == PROC_UNUSED) {
+                continue;
+            }
+            if (p->parent_pid != me->pid) {
+                continue;
+            }
+            if (pid > 0 && (int32_t)p->pid != pid) {
+                continue;
+            }
+            child = p;
+            break;
+        }
+
+        if (!child) {
+            return -1;   /* 没有这个孩子（或者一个孩子都没有） */
+        }
+        if (child->state == PROC_ZOMBIE) {
+            break;
+        }
+
+        /* 孩子还在跑。cpu_halt 让出 CPU，下一次时钟中断就会切过去执行它。
+         * 这条等待路径和 process_run 里那个前台等待循环是同一个套路。 */
+        cpu_halt();
+        stack_guard("process_wait");
+    }
+
+    child_pid = child->pid;
+    code      = child->exit_code;
+
+    /* 回收槽位。和 process_run 结尾那段一样，两件事都得做对：
+     *
+     *   - 必须是我们自己的栈上：孩子已经不在 CPU 上了，但它那份内核栈
+     *     此刻没人踩，kfree 是安全的；
+     *   - 必须关中断：否则时钟中断可以插在"释放内核栈"和"标记 UNUSED"
+     *     中间，reap_zombies 会对同一个指针再释放一次（双重释放）。
+     */
+    {
+        uint32_t flags = irq_save();
+
+        if (child->kernel_stack) {
+            kfree(child->kernel_stack);
+            child->kernel_stack      = NULL;
+            child->kernel_stack_top  = 0;
+            child->kernel_stack_size = 0;
+        }
+        child->state = PROC_UNUSED;
+
+        irq_restore(flags);
+    }
+
+    if (code_out) {
+        *code_out = code;
+    }
+    return (int)child_pid;
+}
+
 int process_kill(uint32_t pid) {
     process_t* p = NULL;
 
@@ -897,6 +1307,7 @@ int process_kill(uint32_t pid) {
         p->exit_code = -1;
         p->end_tick  = timer_get_ticks();
         p->state     = PROC_ZOMBIE;
+        reparent_children(p->pid);
         free_user_resources(p);
 
         irq_restore(flags);

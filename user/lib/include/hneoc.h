@@ -55,6 +55,9 @@
 #define SYS_GETCWD    24
 #define SYS_CHMOD     25
 #define SYS_WHOAMI    26
+#define SYS_FORK      27
+#define SYS_EXEC      28
+#define SYS_WAIT      29
 
 /* ============================================================
  * 系统调用原语
