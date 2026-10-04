@@ -10,6 +10,11 @@
 #include "../include/ports.h"
 #include "../include/kernel.h"
 #include "../include/gdt.h"
+#include "../include/ata.h"
+#include "../include/heap.h"
+#include "../include/pmm.h"
+#include "../include/user.h"
+#include "../include/sysinfo.h"
 
 /* kernel/arch.asm 里的 int 0x80 存根 */
 extern void isr128(void);
@@ -21,7 +26,10 @@ static int32_t sys_getchar(void);
 
 /* 进程控制（实现在后面，要用 copy_user_string） */
 static int32_t sys_exec(uint32_t path_ptr, uint32_t args_ptr, registers_t* regs);
-static int32_t sys_wait(int32_t pid, uint32_t status_ptr);
+static int32_t sys_wait(int32_t pid, uint32_t status_ptr, uint32_t options);
+static int32_t sys_login(uint32_t name_ptr, uint32_t pass_ptr, uint32_t info_ptr);
+static int32_t sys_gettask(uint32_t index, uint32_t buf_ptr);
+static int32_t sys_sysinfo(uint32_t buf_ptr);
 
 uint32_t syscall_total(void) {
     return total_syscalls;
@@ -575,8 +583,12 @@ static int32_t sys_exec(uint32_t path_ptr, uint32_t args_ptr, registers_t* regs)
     return (int32_t)process_exec(regs, path, args);
 }
 
-/* wait：等一个子进程退出并回收它。status 写成子进程的退出码。 */
-static int32_t sys_wait(int32_t pid, uint32_t status_ptr) {
+/* wait：等一个子进程退出并回收它。status 写成子进程的退出码。
+ *
+ * options 的 WNOHANG 位表示"不阻塞"：如果一个已经退出的孩子都没有，
+ * 立刻返回 0。用户态 Shell 靠它顺手收掉后台任务留下的僵尸。
+ */
+static int32_t sys_wait(int32_t pid, uint32_t status_ptr, uint32_t options) {
     int32_t code = 0;
     int rc;
 
@@ -587,9 +599,10 @@ static int32_t sys_wait(int32_t pid, uint32_t status_ptr) {
     /* 系统调用门是 interrupt gate，进来时 IF=0；而 process_wait_child
      * 靠 cpu_halt() 让出 CPU 等孩子退出 —— 关着中断执行 hlt 就是永久停机，
      * 时钟中断永远进不来，调度器也不会切到那个孩子。
-     * 所以和 sys_getchar / sys_sleep 一样，阻塞等待必须临时打开中断。 */
+     * 所以和 sys_getchar / sys_sleep 一样，阻塞等待必须临时打开中断。
+     * （WNOHANG 这条路不会停，但也一并开着，省得两套写法。） */
     enable_interrupts();
-    rc = process_wait_child(pid, &code);
+    rc = process_wait_child(pid, (options & WNOHANG) ? true : false, &code);
     disable_interrupts();
 
     if (rc < 0) {
@@ -600,6 +613,180 @@ static int32_t sys_wait(int32_t pid, uint32_t status_ptr) {
         *(int32_t*)status_ptr = code;
     }
     return rc;
+}
+
+/* ------------------------------------------------------------
+ * Shell 从内核搬到 ring 3 之后要用到的几个
+ * ------------------------------------------------------------ */
+
+/* login：校验用户名和口令，成功就把当前进程的身份和工作目录改掉。
+ *
+ * 校验一定在内核里做：口令表（djb2 哈希）不能交给用户程序去比对，
+ * 否则任何程序都能自己宣布"我是 root"。用户程序只负责收集这两行输入和
+ * 显示结果，它拿到的是一个已经决定好的 uid。
+ */
+static int32_t sys_login(uint32_t name_ptr, uint32_t pass_ptr, uint32_t info_ptr) {
+    char name[LOGIN_NAME_MAX];
+    char pass[64];
+    logininfo_t info;
+    uint32_t uid = 0;
+    bool admin = false;
+
+    if (!user_range_ok(info_ptr, sizeof(logininfo_t))) {
+        return -1;
+    }
+    if (!copy_user_string(name_ptr, name, sizeof(name))) {
+        return -1;
+    }
+    if (!copy_user_string(pass_ptr, pass, sizeof(pass))) {
+        return -1;
+    }
+
+    memset(&info, 0, sizeof(info));
+    if (!user_authenticate(name, pass, &uid, &admin,
+                           info.home, LOGIN_HOME_MAX)) {
+        return -2;   /* 用户名或口令不对 */
+    }
+
+    info.uid   = uid;
+    info.admin = admin ? 1 : 0;
+    strncpy(info.name, name, LOGIN_NAME_MAX - 1);
+
+    {
+        process_t* p = process_current();
+
+        if (p) {
+            p->uid   = uid;
+            p->admin = admin;
+        }
+        process_set_cwd((info.home[0] != '\0') ? info.home : "/");
+    }
+    user_set_current_name(name);
+
+    /* 结构体整块拷回用户空间。
+     * 这里不用 memcpy 到用户指针上直接写：copy_to_user 那套在别处也没做，
+     * 一律走"内核缓冲 + 逐字节搬"的老路子，和 sys_getcwd 保持一致。 */
+    {
+        const uint8_t* src = (const uint8_t*)&info;
+        uint8_t* dst = (uint8_t*)info_ptr;
+
+        for (uint32_t i = 0; i < sizeof(logininfo_t); i++) {
+            dst[i] = src[i];
+        }
+    }
+    return 0;
+}
+
+/* gettask：把进程表第 index 项填进用户的 taskinfo_t。
+ *
+ * 和 listdir 一个套路：调用方从 0 开始一个一个拿，返回 -1 表示没有了。
+ * 中间的空槽位直接跳过（不然 Shell 得自己知道过滤规则）。
+ */
+static int32_t sys_gettask(uint32_t index, uint32_t buf_ptr) {
+    taskinfo_t info;
+    process_t* p = process_get(index);
+
+    if (!p || !user_range_ok(buf_ptr, sizeof(taskinfo_t))) {
+        return -1;
+    }
+    if (p->state == PROC_UNUSED) {
+        return -1;   /* 拿不到有效项：告诉调用方到此为止 */
+    }
+    /* process_get 在越界时返回 NULL，所以"表尾"和"空槽"都归到 -1；
+     * 空槽后面还可能有人，但进程表是从 0 紧凑使用的，不需要担心。 */
+
+    memset(&info, 0, sizeof(info));
+    info.pid        = p->pid;
+    info.ppid       = p->parent_pid;
+    info.state      = (uint32_t)p->state;
+    info.cpu_ticks  = p->cpu_ticks;
+    info.syscalls   = p->syscall_count;
+    info.memory     = p->memory_used + PROCESS_KERNEL_STACK_SIZE;
+    info.start_tick = p->start_tick;
+    info.is_user    = p->is_user ? 1 : 0;
+    strncpy(info.name, p->name, SYSINFO_NAME_MAX - 1);
+
+    {
+        uint8_t* dst = (uint8_t*)buf_ptr;
+        uint8_t* src = (uint8_t*)&info;
+
+        for (uint32_t i = 0; i < sizeof(taskinfo_t); i++) {
+            dst[i] = src[i];
+        }
+    }
+    return 0;
+}
+
+/* sysinfo：一整张系统状态快照，mem / heap / fsstat / diskinfo 四个
+ * 内置命令需要的东西一次给全。 */
+static int32_t sys_sysinfo(uint32_t buf_ptr) {
+    sysinfo_t s;
+    const hneofs_super_t* super = hneofs_super();
+    uint32_t total = pmm_total_frames();
+    uint32_t used  = pmm_used_frames();
+
+    if (!user_range_ok(buf_ptr, sizeof(sysinfo_t))) {
+        return -1;
+    }
+
+    memset(&s, 0, sizeof(s));
+
+    s.mem_total_kb = total * (PAGE_SIZE / 1024);
+    s.mem_used_kb  = used  * (PAGE_SIZE / 1024);
+    s.mem_free_kb  = (total - used) * (PAGE_SIZE / 1024);
+
+    heap_stats(&s.heap_total, &s.heap_used, &s.heap_free, &s.heap_blocks);
+    s.heap_start = heap_region_start();
+
+    s.uptime_sec = timer_get_uptime_seconds();
+    s.ticks      = timer_get_ticks();
+    s.tick_hz    = 100;
+    s.syscalls   = syscall_total();
+
+    s.procs_live  = process_live_count();
+    s.procs_total = process_total_created();
+
+    s.disk_sectors = 0;
+    {
+        const ata_device_t* dev = ata_get_device(0);
+
+        if (dev) {
+            s.disk_sectors = dev->sectors;
+        }
+    }
+    s.disk_reads   = ata_sectors_read();
+    s.disk_writes  = ata_sectors_written();
+
+    if (super) {
+        /* 目录项总数和空洞无关：数一遍真正有效的项 */
+        uint32_t live = 0;
+
+        for (uint32_t i = 0; i < super->file_count; i++) {
+            const hneofs_file_t* f = hneofs_file(i);
+
+            if (f && f->name[0] != '\0') {
+                live++;
+            }
+        }
+        s.fs_entries    = super->file_count;
+        s.fs_live       = live;
+        s.fs_data_lba   = super->data_lba;
+        s.fs_free_lba   = super->free_lba;
+        s.fs_free_bytes = hneofs_free_bytes();
+    }
+
+    s.screen_rows = VGA_HEIGHT;
+    s.screen_cols = VGA_WIDTH;
+
+    {
+        uint8_t* dst = (uint8_t*)buf_ptr;
+        uint8_t* src = (uint8_t*)&s;
+
+        for (uint32_t i = 0; i < sizeof(sysinfo_t); i++) {
+            dst[i] = src[i];
+        }
+    }
+    return 0;
 }
 
 static int32_t sys_getchar(void) {
@@ -905,8 +1092,64 @@ void syscall_handler(registers_t* regs) {
             break;
 
         case SYS_WAIT:
-            ret = sys_wait((int32_t)regs->ebx, regs->ecx);
+            ret = sys_wait((int32_t)regs->ebx, regs->ecx, regs->edx);
             break;
+
+        case SYS_LOGIN:
+            /* 名字、口令在 sys_login 里才从用户空间拷进来 —— 这里只是转发 */
+            ret = sys_login(regs->ebx, regs->ecx, regs->edx);
+            break;
+
+        case SYS_CHDIR: {
+            char path[128];
+
+            if (!copy_user_string(regs->ebx, path, sizeof(path))) {
+                ret = -1;
+                break;
+            }
+            {
+                int32_t idx = hneofs_resolve(path);
+
+                if (idx < 0) {
+                    ret = -2;   /* 没有这个路径 */
+                } else if (hneofs_file((uint32_t)idx)->type != HNEOFS_TYPE_DIR) {
+                    ret = -3;   /* 不是目录 */
+                } else {
+                    process_set_cwd(path);
+                    ret = 0;
+                }
+            }
+            break;
+        }
+
+        case SYS_KILL:
+            ret = process_kill(regs->ebx);
+            break;
+
+        case SYS_GETTASK:
+            ret = sys_gettask(regs->ebx, regs->ecx);
+            break;
+
+        case SYS_SYSINFO:
+            ret = sys_sysinfo(regs->ebx);
+            break;
+
+        case SYS_USERADD: {
+            char name[LOGIN_NAME_MAX];
+            char pass[64];
+
+            if (!process_is_admin()) {
+                ret = -4;   /* 不是管理员 */
+                break;
+            }
+            if (!copy_user_string(regs->ebx, name, sizeof(name)) ||
+                !copy_user_string(regs->ecx, pass, sizeof(pass))) {
+                ret = -1;
+                break;
+            }
+            ret = user_add(name, pass, regs->edx != 0);
+            break;
+        }
 
         default:
             ret = -1;   /* 未知系统调用 */

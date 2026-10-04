@@ -209,8 +209,24 @@ int process_exec(registers_t* regs, const char* filename, const char* args);
 /* 等一个子进程退出并回收它的槽位，退出码写进 *code_out（可为 NULL）。
  * pid > 0 等指定孩子，pid <= 0 等任意一个孩子。
  * 返回被回收的子进程 pid；没有这样的孩子返回 -1。
+ *
+ * nohang = true 时完全不阻塞：手头没有已经退出的孩子就直接返回 0。
+ * 用户态 Shell 用它顺手收掉后台任务留下的僵尸。
+ *
+ * 等待期间会把被等的进程设成"前台"，Ctrl+C 就是杀它 —— 见下面对
+ * fg_pid 的说明。process_run 也是靠这个函数实现的。
  */
-int process_wait_child(int32_t pid, int32_t* code_out);
+int process_wait_child(int32_t pid, bool nohang, int32_t* code_out);
+
+/* 把 pid 设成前台进程。0 表示"没有前台进程"。
+ *
+ * Ctrl+C 落在谁头上就靠它：内核里只有一个键盘，没有进程组也没有终端
+ * 的前台概念，所以用"最内层的那个 wait"来定义前台 ——
+ * 内核 Shell 等用户态 Shell 时先把前台设成 Shell，Shell 再等某条命令时
+ * 又把它改成那条命令，Shell 的 wait 结束时恢复成 Shell。
+ * 于是"谁在前台"永远等于"嵌套最深的那个等待的目标"，这正是终端的语义。
+ */
+void process_set_foreground(uint32_t pid);
 
 /* 强行结束某个进程。返回 0 成功，负数是各种拒绝原因：
  * -1 没有这个 pid，-2 不能杀 Shell，-3 不能杀自己，-4 已经退出

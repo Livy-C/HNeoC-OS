@@ -123,12 +123,20 @@ int exec(const char* path, const char* args) {
     return (int)__syscall2(SYS_EXEC, (int32_t)path, (int32_t)args);
 }
 
-int waitpid(int pid, int* status) {
-    return (int)__syscall2(SYS_WAIT, pid, (int32_t)status);
+int waitpid(int pid, int* status, int options) {
+    return (int)__syscall3(SYS_WAIT, pid, (int32_t)status, options);
 }
 
 int wait(int* status) {
-    return waitpid(-1, status);
+    return waitpid(-1, status, 0);
+}
+
+int chdir(const char* path) {
+    return (int)__syscall1(SYS_CHDIR, (int32_t)path);
+}
+
+int kill(int pid) {
+    return (int)__syscall1(SYS_KILL, pid);
 }
 
 /* ---- 终端输入 ---- */

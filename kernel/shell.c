@@ -2143,8 +2143,19 @@ void shell_print_banner(void) {
 
 /* ------------------------------------------------------------
  * Shell 主循环
+ *
+ * 从 0.3.0 起，Shell 本身已经搬到 ring 3 了（user/sh.c），
+ * 这里变成了一个 getty 式的 respawn 循环：不停地把 /bin/sh.lxe 拉起来，
+ * 它一退出（比如用户敲了 exit，或者按 Ctrl+C 把它打断了）就再拉一个，
+ * 效果就是回到登录界面。
+ *
+ * 下面这个内置 Shell 只在**拉不起来的时候**才跑：比如磁盘没挂上、
+ * /bin/sh.lxe 被人删了、镜像太大读不进来。它是最后一道保险，
+ * 免得系统开机之后没有任何办法敲命令。
  * ------------------------------------------------------------ */
-void shell_run(void) {
+
+/* 内置 Shell：user_login 会自己提示用户名和口令 */
+static void shell_builtin(void) {
     /* 先登录。拿到 uid 和工作目录之后，提示符和文件权限检查才有意义。 */
     while (!user_login()) {
         /* 登录失败就重新问，不放行 —— 除非账户表本身读不到，
@@ -2162,4 +2173,37 @@ void shell_run(void) {
         history_add(line);
         shell_execute(line);
     }
+}
+
+/* Shell 主循环：先把用户态 Shell 拉起来，拉不起来才退回内置 Shell。
+ * 这个函数**不返回**（返回就意味着内置 Shell 也退出了，那没什么可做的）。
+ */
+void shell_run(void) {
+    static bool warned = false;
+
+    for (;;) {
+        int rc = process_run("/bin/sh.lxe", "");
+
+        /* rc >= 0 说明用户态 Shell 正常跑完并退出了（比如敲了 exit），
+         * 那就再拉一个 —— 和 getty 一样。
+         *
+         * rc < 0 是加载失败：文件不在、文件系统没挂上、镜像超限……
+         * 第一次失败时打印一句人话，然后就退回内置 Shell。
+         * 只在第一次打印是因为加载失败会立刻重试，不拦着的话
+         * 屏幕上会瞬间刷满同一句话。 */
+        if (rc < 0) {
+            if (!warned) {
+                warned = true;
+                vga_set_color(VGA_COLOR_YELLOW, VGA_COLOR_BLACK);
+                vga_write("cannot run /bin/sh.lxe (");
+                vga_write_uint((uint32_t)(-rc));
+                vga_writeln(") - falling back to the built-in shell");
+                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            }
+            break;
+        }
+        warned = false;
+    }
+
+    shell_builtin();
 }

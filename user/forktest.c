@@ -72,7 +72,7 @@ int main(void) {
             }
 
             status = -1;
-            rc = waitpid(pid, &status);
+            rc = waitpid(pid, &status, 0);
             if (rc != pid || status != want) {
                 printf("FAIL: round %d: reaped %d exit %d (wanted %d / %d)\n",
                        i, rc, status, pid, want);
@@ -122,7 +122,7 @@ int main(void) {
      * 2. waitpid：等指定的孩子，取它的退出码
      * ============================================================ */
     status = -1;
-    rc = waitpid(pid, &status);
+    rc = waitpid(pid, &status, 0);
     if (rc != pid) {
         printf("FAIL: waitpid returned %d, expected %d\n", rc, pid);
         return 1;
@@ -223,7 +223,7 @@ int main(void) {
         }
 
         status = -1;
-        rc = waitpid(pid, &status);
+        rc = waitpid(pid, &status, 0);
         if (rc != pid || status != 0) {
             printf("FAIL: the child did not get a faithful heap copy "
                    "(exit %d)\n", status);
@@ -258,7 +258,7 @@ int main(void) {
     }
 
     status = -1;
-    rc = waitpid(pid, &status);
+    rc = waitpid(pid, &status, 0);
     if (rc != pid || status != 0) {
         printf("FAIL: exec'd child: reaped %d, exit %d (expected %d and 0)\n",
                rc, status, pid);

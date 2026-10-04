@@ -4,6 +4,7 @@
 #include "../include/paging.h"
 #include "../include/process.h"
 #include "../include/kernel.h"
+#include "../include/pmm.h"
 
 /* 256 个中断门 */
 #define IDT_ENTRIES 256
@@ -107,6 +108,20 @@ uint32_t isr_handler(registers_t* regs) {
             vga_writeln(exception_messages[regs->int_no]);
             vga_write("   EIP ");
             vga_write_hex32(regs->eip);
+            /* 用户栈指针、入口地址和空闲页框数一起打出来。
+             * EIP 落在 0 上时最需要区分的几件事：是 call 了 NULL 还是
+             * ret 弹出了 0（栈被砸了）、进程到底从哪儿开始跑、
+             * 以及是不是物理内存被吃光了。
+             * 这三条就是 0.3.0 那次"用户态 Shell 下 hncc 崩在 EIP 0"
+             * 排查里最有用的信息。 */
+            vga_write("   USERESP ");
+            vga_write_hex32(regs->useresp);
+            vga_write("   entry ");
+            vga_write_hex32(p->entry);
+            vga_write("   stackbase ");
+            vga_write_hex32(p->user_stack_base);
+            vga_write("   freeframes ");
+            vga_write_hex32(pmm_free_frames());
             if (regs->int_no == 14) {
                 uint32_t cr2 = paging_fault_address();
 

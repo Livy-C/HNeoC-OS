@@ -58,6 +58,12 @@
 #define SYS_FORK      27
 #define SYS_EXEC      28
 #define SYS_WAIT      29
+#define SYS_LOGIN     30
+#define SYS_CHDIR     31
+#define SYS_KILL      32
+#define SYS_GETTASK   33
+#define SYS_SYSINFO   34
+#define SYS_USERADD   35
 
 /* ============================================================
  * 系统调用原语

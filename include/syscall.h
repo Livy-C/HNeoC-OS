@@ -58,9 +58,23 @@
  */
 #define SYS_FORK      27   /* fork() -> 子进程里返回 0，父进程里返回子进程 pid */
 #define SYS_EXEC      28   /* exec(path, args) -> 成功不返回，失败返回负的错误码 */
-#define SYS_WAIT      29   /* wait(pid, status_ptr) -> 被回收的子进程 pid */
+#define SYS_WAIT      29   /* wait(pid, status_ptr, options) -> 被回收的子进程 pid */
 
-#define SYS_COUNT     30
+/* ------------------------------------------------------------
+ * 把 Shell 从内核搬到 ring 3 需要的几个
+ *
+ * 原来的内核 Shell 是"直接读内核变量"来显示状态的，搬到用户态之后
+ * 没有那条路了，所以这些调用专门负责把内核的状态递出去，
+ * 以及把只有内核才能做的事（认证、改工作目录、杀进程）暴露出来。
+ * ------------------------------------------------------------ */
+#define SYS_LOGIN     30   /* login(name, pass, info) -> 0，info 回填 uid/admin/name/home */
+#define SYS_CHDIR     31   /* chdir(path) -> 0，失败返回负的错误码 */
+#define SYS_KILL      32   /* kill(pid) -> 0，失败返回负的错误码 */
+#define SYS_GETTASK   33   /* gettask(index, buf) -> 0；-1 表示后面没有任务了 */
+#define SYS_SYSINFO   34   /* sysinfo(buf) -> 0，buf 里是 sysinfo_t */
+#define SYS_USERADD   35   /* useradd(name, pass, admin) -> 0（只有管理员能用） */
+
+#define SYS_COUNT     36
 
 /* 目录遍历的返回值里，用 bit30 表示"这是个目录"。
  *

@@ -132,8 +132,34 @@ $checks = @(
                   "Reserved the boot stack at 0x90000",
                   "Kernel heap \(kmalloc / kfree\)") },
 
-    @{ Name = "login as root";    Send = @("root", "root");
-       Expect = @("welcome, root \(admin\)") },
+    # Shell 现在是 ring 3 的用户程序（user/sh.c），内核只负责把它拉起来。
+    # banner 里带着 pid 和 ring 3，正好证明"登录之后拿到提示符的是磁盘上的
+    # sh.lxe"，而不是 kernel/shell.c 里那个备用 Shell。
+    #
+    # 注意：这一条不能单独拆成 Send = @() 的检查 —— 上一条扫过的范围里
+    # 已经把 banner 含进去了，扫描光标推过去之后就再也找不到。
+    @{ Name = "login as root, into a ring 3 shell";
+       Send = @("root", "root");
+       Expect = @("welcome, root \(admin\)",
+                  "HNeoC OS user-mode shell   pid \d+   ring 3") },
+
+    @{ Name = "user-mode builtins"; Send = @("pwd", "echo hello-from-sh",
+                                             "whoami");
+       Expect = @("hello-from-sh", "root   uid 0  \(admin\)") },
+
+    @{ Name = "cd moves the prompt"; Send = @("cd /home");
+       Expect = @('hneoc\$root~/home') },
+
+    @{ Name = "taskmgr reads the process table"; Send = @("taskmgr");
+       Expect = @("HNeoC task manager",
+                  "pid  ppid  name",
+                  "ring 3") },
+
+    @{ Name = "sh runs disk programs via fork+exec+wait"; Send = @("ver");
+       Expect = @("this program  : ring 3 user mode, pid \d+") },
+
+    @{ Name = "background jobs"; Send = @("bg &", "jobs");
+       Expect = @("\[\d+\] \d+", "pid \d+  bg") },
 
     @{ Name = "shell + ver";      Send = @("ver");
        Expect = @("kernel        : 0\.3\.0") },

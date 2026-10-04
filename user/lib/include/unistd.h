@@ -103,14 +103,25 @@ int exec(const char* path, const char* args);
 /* 等一个子进程退出并回收它，退出码写进 *status（可以为 NULL）。
  *
  * pid > 0 等指定那个孩子；pid <= 0 等任意一个先退出的孩子。
+ * options 里带 WNOHANG（见 sysinfo.h）时不阻塞：手头没有已经退出的
+ * 孩子就立刻返回 0 —— 用户态 Shell 靠它顺手收掉后台任务的僵尸。
  * 返回被回收的子进程 pid；没有这样的孩子返回 -1。
  *
  * 必须是这个进程自己 fork 出来的孩子才能等 —— 别人家的孩子等不到。
  */
-int waitpid(int pid, int* status);
+int waitpid(int pid, int* status, int options);
 
-/* waitpid(-1, status) 的简写 */
+/* waitpid(-1, status, 0) 的简写 */
 int wait(int* status);
+
+/* 换当前工作目录。成功返回 0，失败返回负的错误码。
+ * 和内核 Shell 的 cd 走的是同一条路径解析。 */
+int chdir(const char* path);
+
+/* 结束一个进程。返回 0 成功，负数是各种拒绝原因
+ * （-1 没有这个 pid、-2 那是内核 Shell、-3 不能杀自己、-4 已经退出）。
+ * 只能杀自己的子进程或者（管理员）别人的进程。 */
+int kill(int pid);
 
 /* ============================================================
  * 终端输入

@@ -28,6 +28,14 @@ static bool     force_switch = false;   /* 主动让出或被退出时置位 */
  */
 static volatile uint32_t sched_locked = 0;
 
+/* 前台进程：Ctrl+C 杀的就是它。用"保存 + 恢复"的栈式纪律管着，
+ * 所以嵌套的等待会自动让最内层的那个当前台（见 process_set_foreground）。 */
+static uint32_t fg_pid = 0;
+
+void process_set_foreground(uint32_t pid) {
+    fg_pid = pid;
+}
+
 /* 定义在后面，process_init 里要用 */
 static void init_fds(process_t* p);
 
@@ -840,7 +848,8 @@ void process_exit_current(int32_t code) {
 int process_run(const char* filename, const char* args) {
     int err = 0;
     process_t* p = load_program(filename, args, &err);
-    int32_t code;
+    int32_t code = 0;
+    int rc;
 
     if (!p) {
         return err;
@@ -849,50 +858,18 @@ int process_run(const char* filename, const char* args) {
     /* 丢掉可能在提示符处按下的 Ctrl+C，免得刚启动的程序立刻被杀 */
     (void)keyboard_take_ctrl_c();
 
-    /* 等它跑完。cpu_halt 会让出 CPU，时钟中断随时可以切过去执行它。 */
-    while (p->state != PROC_ZOMBIE) {
-        cpu_halt();
-        stack_guard("process_run");
-
-        /* Ctrl+C 打断前台程序。
-         * 这是把跑飞的程序拉回来的唯一办法：Shell 此刻正阻塞在这个循环里，
-         * 没有别的地方能收命令。杀掉之后循环条件不成立，正常往下走。
-         */
-        if (keyboard_take_ctrl_c()) {
-            process_kill(p->pid);
-        }
-    }
-
-    code = p->exit_code;
-
-    /* 回收槽位。
+    /* 等它跑完。
      *
-     * 这里不能指望 reap_zombies 已经回收了内核栈：它只在时钟中断里回收
-     * "当前不在跑"的僵尸，而 Shell 早在孩子退出那一刻就被切回来了，
-     * 我们下面马上就把槽位标成 UNUSED，reap_zombies 再也不会看它一眼 ——
-     * 那 8KB 内核栈就永远漏掉了（紧接着 alloc_slot 会把槽位 memset 掉，
-     * 连指针一起丢）。所以在这里自己释放，和 reap_zombies 做的一样。
+     * 这一段原来是自带一份"轮询 + 回收 + Ctrl+C"的循环，和 process_wait_child
+     * 是重复的 —— 两处都要处理"释放内核栈和标记 UNUSED 之间不能进时钟中断"、
+     * 都要处理 Ctrl+C 杀前台。合并成一次调用之后只剩一个地方要维护。
      *
-     * 这一条不是洁癖：实测把这段去掉（故意留泄漏）之后，重复运行前台程序
-     * 到第 8~9 次就会让虚拟机直接 Guru Meditation 崩掉，堆里的内核栈
-     * 地址一路从 0x101F40 涨到 0x10FFE8。释放掉之后，同一个负载跑 25 次
-     * 都没事（栈块被复用，堆不再单调增长）。
-     *
-     * 关中断是为了别让时钟中断插在"释放栈"和"标记 UNUSED"之间：
-     * 否则 reap_zombies 可能对同一个指针再释放一次。
+     * load_program 建的进程 parent_pid 就是当前进程（内核 Shell，pid 0），
+     * 所以 process_wait_child 按父进程找孩子的规则天然适用。
      */
-    {
-        uint32_t flags = irq_save();
-
-        if (p->kernel_stack) {
-            kfree(p->kernel_stack);
-            p->kernel_stack      = NULL;
-            p->kernel_stack_top  = 0;
-            p->kernel_stack_size = 0;
-        }
-        p->state = PROC_UNUSED;
-
-        irq_restore(flags);
+    rc = process_wait_child((int32_t)p->pid, false, &code);
+    if (rc < 0) {
+        return err;
     }
 
     return (int)code;
@@ -1195,15 +1172,18 @@ int process_exec(registers_t* regs, const char* filename, const char* args) {
     return 0;
 }
 
-int process_wait_child(int32_t pid, int32_t* code_out) {
+int process_wait_child(int32_t pid, bool nohang, int32_t* code_out) {
     process_t* me = current;
     process_t* child;
+    uint32_t saved_fg;
     uint32_t child_pid;
     int32_t  code;
 
     if (!me) {
         return -1;
     }
+
+    saved_fg = fg_pid;
 
     for (;;) {
         child = NULL;
@@ -1226,17 +1206,41 @@ int process_wait_child(int32_t pid, int32_t* code_out) {
         }
 
         if (!child) {
+            fg_pid = saved_fg;
             return -1;   /* 没有这个孩子（或者一个孩子都没有） */
         }
         if (child->state == PROC_ZOMBIE) {
             break;
         }
+        if (nohang) {
+            fg_pid = saved_fg;
+            return 0;    /* 还都在跑，调用方不想等 */
+        }
 
-        /* 孩子还在跑。cpu_halt 让出 CPU，下一次时钟中断就会切过去执行它。
-         * 这条等待路径和 process_run 里那个前台等待循环是同一个套路。 */
+        /* 前台就是它：下面这段时间里按的 Ctrl+C 都算在它头上。
+         * 嵌套的时候内层的 wait 会把它覆盖掉，于是"谁在前台"自动等于
+         * "嵌套最深的那个等待的目标"（见 process_set_foreground）。 */
+        fg_pid = child->pid;
+
+        /* 孩子还在跑。cpu_halt 让出 CPU，下一次时钟中断就会切过去执行它。 */
         cpu_halt();
         stack_guard("process_wait");
+
+        /* Ctrl+C 打断前台程序。
+         *
+         * 这是把跑飞的程序拉回来的唯一办法：等待的人此刻正阻塞在这个循环里，
+         * 没有别的地方能收命令。杀掉之后循环条件不成立，正常往下走。
+         *
+         * 为什么要先比一下 fg_pid：嵌套等待时外层的 wait 也在转这个循环，
+         * 而 Ctrl+C 只有一个。比一下就能保证只有最内层（真正的前台）收走它，
+         * 否则外层会抢先把用户态 Shell 自己杀掉，而用户想杀的是它跑的那条命令。
+         */
+        if (fg_pid == child->pid && keyboard_take_ctrl_c()) {
+            process_kill(child->pid);
+        }
     }
+
+    fg_pid = saved_fg;
 
     child_pid = child->pid;
     code      = child->exit_code;

@@ -6,8 +6,9 @@
 
 它已经不是一个玩具 Demo 了：有物理内存管理、分页、ATA 磁盘驱动、自己的文件
 系统、ring 3 用户态、系统调用、`fork` / `exec` / `wait`、抢占式多任务调度、
-多用户账户与文件权限，以及一个任务管理器。Shell 里的每条命令都是磁盘上一个
-独立的可执行文件。
+多用户账户与文件权限，以及一个任务管理器。**Shell 自己也是一个 ring 3 的
+用户程序**（`user/sh.c`），磁盘上的每条命令都是独立的可执行文件，靠
+fork + exec + wait 跑起来 —— 和真实 Unix 一样。
 
 ```
 login: root
@@ -196,6 +197,7 @@ typedef struct {
 
 | 命令 | 文件 | 说明 |
 |------|------|------|
+| `sh` | `sh.lxe` | **用户态 Shell 本体**（ring 3）：提示符、行编辑、历史、内建命令、PATH 查找，开机由内核拉起（见下） |
 | `ls` | `ls.lxe` | 列出目录（不带参数就是当前工作目录） |
 | `ver` | `ver.lxe` | 版本与运行环境信息 |
 | `hello` | `hello.lxe` | 最小的用户态示例，验证 bss 清零和系统调用 |
@@ -580,7 +582,7 @@ counter after the loop:
 所以可以直接在系统里跑 `hneoc$root~/share/hncc hncc hncc.c` —— 让 hncc 编译它自己。
 这条路的价值在于它拿一份 4900 行的真实程序去撞编译器的每一条限制：
 撞出来的每个缺口都补上了对应的一组 `tN.c` 诊断和回归检查。
-进度和还差什么写在 `KNOWN-ISSUES.md` 第 4 节（现在卡在"内建 term_* 函数"
+进度和还差什么写在 `KNOWN-ISSUES.md` 第 5 节（现在卡在"内建 term_* 函数"
 和"AST 节点太大"这两件事上）。
 
 结构体的三条限制（都是**明确报错**，不会默默生成坏代码）：
@@ -753,6 +755,57 @@ uid / 工作目录全部保留。实现上复用了普通加载路径：先按"�
 `forktest` 是这三个调用的自检程序，`forktest stress 30` 则是泄漏压测：
 反复 fork / malloc / exit / wait，进程表只有 16 个槽，任何一处漏了
 十来轮之内就会失败。
+
+### 用户态 Shell（`user/sh.c`）
+
+**Shell 自己就是磁盘上的一个程序。** 开机之后内核做唯一一件事：把
+`/bin/sh.lxe` 拉起来（`kernel/shell.c` 的 `shell_run`），它一退出就再拉一个
+—— 那个循环就是 getty：在提示符下敲 `exit` 或者按 Ctrl+C 把 Shell 打断，
+出来的都是重新登录。
+
+```
+login: root            <- 这两行是 sh 自己画的，口令校验走 SYS_LOGIN
+Password: ****
+welcome, root (admin)
+HNeoC OS user-mode shell   pid 1   ring 3
+hneoc$root~/ forktest
+```
+
+Shell 里有什么：
+
+| 部分 | 在哪 |
+|------|------|
+| 提示符、行编辑（方向键 / Home / End / Delete / Ctrl+U / Ctrl+L） | `user/sh.c` |
+| 命令历史（上下键翻，20 条） | `user/sh.c` |
+| 内建命令（`cd` `pwd` `echo` `whoami` `users` `useradd` `login` `history` `clear` `exit` `help` `jobs` `kill` `mem` `taskmgr`） | `user/sh.c` |
+| PATH 查找（先 `/bin/<名字>.lxe`，再当前目录） | `user/sh.c` |
+| 跑磁盘命令：fork + exec + wait | `user/sh.c` |
+| 后台任务（行尾 `&`）+ 顺手收僵尸 | `user/sh.c` 的 `reap_jobs` |
+| **口令校验**、改工作目录、杀进程、进程表、内存/磁盘统计 | 内核系统调用 |
+
+分工的界线很明确：**用户自己能做的都在用户态做；只有"必须知道内核内部状态"
+或者"必须由内核裁决权限"的事才走系统调用**。所以为了这次搬家加了这几个调用：
+`SYS_LOGIN` / `SYS_CHDIR` / `SYS_KILL` / `SYS_GETTASK` / `SYS_SYSINFO` /
+`SYS_USERADD`，数据结构定义在 `include/sysinfo.h`（用户库那边有一份逐字节
+一致的副本）。
+
+几个值得记下来的决定：
+
+- **口令校验留在内核**。Shell 收用户名和口令，但比对由 `SYS_LOGIN` 做。
+  要是让用户程序自己读 `/etc/passwd` 比对，任何程序都能宣布"我是 root"。
+- **Ctrl+C 杀的是"前台进程"**，由 `process_wait_child` 里的 `fg_pid` 定义（见
+  下面）。Shell 等某条命令时前台就是那条命令，所以 Ctrl+C 不会把 Shell 自己
+  打死 —— 但**在提示符下按 Ctrl+C 会杀掉 Shell**（此时前台就是它），内核随即
+  再拉起一个，效果等于重新登录。这是有意的：用户态 Shell 里没有别的办法
+  从卡死状态里出来。
+- **菜单里那几条内核内置命令（`mem` / `heap` / `fsstat` / `diskinfo` /
+  `taskmgr`）搬成了用户程序**，数据来自 `SYS_SYSINFO` / `SYS_GETTASK`。
+  `kernel/shell.c` 里那份实现还在，但只在**用户态 Shell 拉不起来时**才跑
+  （磁盘没挂上、`/bin/sh.lxe` 被删了之类），是最后一道保险。
+- **提示符不带转义序列**。`sh` 自己吐 ANSI 颜色码，但传给行编辑的是**纯文本
+  提示符 + 它的可见宽度**：整行重画时要按可见宽度算"还能敲几个字"，带转义的
+  字符串长度是错的。颜色在调 `readline` 之前设好，中间不改属性，重画出来的
+  提示符就还是那个颜色。
 
 ### 控制台支持 ANSI 转义序列
 
@@ -1170,6 +1223,14 @@ $b = New-Object byte[] 4096; $null = $fs.Read($b, 0, 4096)
     BOM 没了，PowerShell 按 GBK 一读，中文注释吃掉换行，报的是
     `Missing expression after ','`。所以改完 `.ps1` 一定顺手确认
     `[System.IO.File]::ReadAllBytes($p)[0..2]` 是 `EF BB BF`。
+
+    再补一条：**这条坑对 `.c` / `.md` 一样成立**，只是症状不同 ——
+    `.ps1` 是直接语法错误，`.c` 则是注释变成乱码、而代码照样编译通过，
+    于是一路带着一堆乱码进了提交。`forktest.c` 就这么被
+    `Get-Content -Raw | Set-Content -Encoding UTF8` 毁过一次：
+    读的时候按 GBK 解，写的时候再按 UTF-8 编，中文注释就锁死成了乱码。
+    所有无 BOM 的 UTF-8 文件都要用 .NET 的 API 碰，
+    或者干脆别用 PowerShell 改文本。
 
 34. **系统盘满会让编译器以一个看不懂的理由失败**：GCC 的中间文件默认写到
     系统 `%TEMP%`，盘一满就报 `error writing to ...s: No space left on device`，

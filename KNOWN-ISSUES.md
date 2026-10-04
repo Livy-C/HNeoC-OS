@@ -212,7 +212,8 @@ panic，并把入口名、当时 esp、返回地址打出来。
 | 口令哈希不是安全 | `kernel/user.c` | djb2 无盐、算法公开，能写 `/etc/passwd` 就能加账户；只做到"明文不落盘" |
 | `/home` 是 0777 | `tools/mkfs.ps1` | 没有用户组、也没有"每个用户一个私有目录"的机制，只好让所有用户都能在 `/home` 下建目录 |
 | hncc 只支持 C 子集 | `user/hncc.c` | 还缺：浮点、真正的预处理器、多文件编译，以及初始化列表里的嵌套数组和结构体元素（结构体、`enum`/`switch`、`typedef`、变参 / `printf`、初始化列表、`static` 等修饰词都已实现，并有回归检查覆盖） |
-| hncc 还不能自举 | `user/hncc.c` | 见下面第 4 节：自举试验一路把编译器打补丁打到现在，还差"忽略 #include 带来的依赖问题"和"AST 节点太大"这两道坎 |
+| hncc 还不能自举 | `user/hncc.c` | 见下面第 5 节：自举试验一路把编译器打补丁打到现在，还差"忽略 #include 带来的依赖问题"和"AST 节点太大"这两道坎 |
+| 缩小语法树的改造会崩 | `user/hncc.c` | 工作区里那一版（`name_pool`/`str_pool`、`node_t` 430→108 字节）在用户态 Shell 下一进 `main` 就缺页死掉，见下面第 4 节。`user/hncc.c` 现在是已提交的那个能跑的版本，改造版备份在 `build/hncc-inprogress.c` |
 | 局部变量不能和 typedef 名重名 | `user/hncc.c` | `typedef int T;` 之后再写 `int T;`，那个位置会被当成类型名（`is_type_kw()` 把 typedef 名算作类型）。真实代码里少见，所以只在 README 里说明，没做符号表分层 |
 | hpm 不做版本升级 | `user/hpm.c` | `install` 只判断"装没装过"，不比较版本；也没有 `upgrade` |
 | hpm 卸载后留下空目录 | `user/hpm.c` | 只删文件、不删目录（没有 rmdir），会在屏幕上直说 |
@@ -225,7 +226,51 @@ panic，并把入口名、当时 esp、返回地址打出来。
 
 ---
 
-## 4. hncc 自举：做到哪了、还差什么
+## 4. 镜像大的程序在 fork+exec 之后崩在 EIP 0（未解决）
+
+**症状**：在用户态 Shell 里跑 `hncc`（那一版工作区里没提交的"缩小语法树"改造，
+image+bss 是 223 页 ≈ 913KB）时，进程一进 `main` 就缺页死掉：
+
+```
+process 'hncc' killed: Page Fault
+   EIP 0x00000000   USERESP 0x403FFD6C   entry 0x40000000
+   stackbase 0x403F8000   freeframes 0x00001783   CR2 0x00000000
+```
+
+**已经排掉的解释**（都实测过）：
+
+| 猜测 | 怎么排掉的 |
+|------|-----------|
+| `exec` 本身坏了 | 同一个 `exec` 跑 `ver` / `ls` / `hello` / `hpm` / `vi` / `forktest` / `bigdata`(526KB) 全正常 |
+| 是 hncc 那版改造的 bug | 把 `user/hncc.c` 退回上一次提交（image 123 页），**在同一个 Shell 里编译成功** |
+| 2MB 的 arena 太大 | 只把**已提交**那版的 `ARENA_CAP` 从 1MB 改成 2MB（image 仍是 123 页）—— 照样成功 |
+| 物理内存不够 | 崩溃时空闲页框还有 0x1783 = 6019 页 ≈ 24MB |
+| 用户栈溢出 | `USERESP 0x403FFD6C`，栈底 `0x403F8000` —— 只用了 660 字节，栈里还全是 0 |
+| 加载器没把 `.bss` 清零 | 帧是 `memset` 过的，`entry` / `heap_start` / `image_pages` 都对着（223 页，`heap=0x400DF000`） |
+
+**变量只剩一个**：那一版 hncc 比已提交的版本多了 **384KB 的 `.bss`**
+（`name_pool` + `str_pool` 各 192KB），image 从 123 页涨到 223 页。
+也就是说触发条件是"映像页数从 123 涨到 223"，和 arena 大小、和那段改造的逻辑无关。
+
+**还有一条强线索**：同一个 223 页的镜像，用**内核 Shell 的 `process_run`**（也就是
+`create_from_header_locked` 直接建进程）跑起来是**正常**的，只有走
+"fork 出来的孩子再 exec"这条路才崩。所以问题出在
+`process_exec` 的地址空间交换上，而不是加载器本身 —— 但还没找到具体是哪一处。
+
+**已经检查过、确认无误的部分**（`kernel/process.c` 的 `swap_address_space`）：
+标量字段逐个对调、页框数组按各自的条数搬、CR3 在释放旧页目录之前先刷、
+`image_frames[]` 里"映像页 + 堆页连续存放"的记账也对得上。
+
+**下一步的入手点**：拿 223 页这个数字去二分 ——
+把那一版 hncc 的两个 pool 从 192KB 降到 160KB/128KB，看从哪一档开始崩；
+再把 `USER_MAX_PAGES`、`paging_create_user_table` 的入口数、
+`process_sbrk` 的记账逐条对一遍。工作区里那版 hncc 的源码备份在
+`build/hncc-inprogress.c`，`user/hncc.c` 现在是已提交的可正常工作版本。
+
+
+---
+
+## 5. hncc 自举：做到哪了、还差什么
 
 **做法**：`build.ps1` 把 `user/hncc.c` 拷进镜像的 `/share/hncc/hncc.c`
 （生成的副本，不进版本库），然后在系统里跑

@@ -341,8 +341,6 @@ void user_list(void) {
 bool user_login(void) {
     char name[USER_NAME_MAX];
     char pw[32];
-    char stored[16];
-    char want[9];
     char home[USER_HOME_MAX];
     uint32_t uid = 0;
     bool admin = false;
@@ -370,29 +368,24 @@ bool user_login(void) {
         vga_write("Password: ");
         read_line(pw, sizeof(pw), false);
 
-        if (name[0] &&
-            find_user(name, stored, sizeof(stored), &uid, home, sizeof(home), &admin)) {
-            hex8(want, user_hash_password(pw));
+        if (user_authenticate(name, pw, &uid, &admin, home, sizeof(home))) {
+            process_t* p = process_current();
 
-            if (strcmp(want, stored) == 0) {
-                process_t* p = process_current();
+            strncpy(current_name, name, USER_NAME_MAX - 1);
+            current_name[USER_NAME_MAX - 1] = '\0';
 
-                strncpy(current_name, name, USER_NAME_MAX - 1);
-                current_name[USER_NAME_MAX - 1] = '\0';
-
-                if (p) {
-                    p->uid   = uid;                     /* 权限检查就看这两个 */
-                    p->admin = admin;
-                }
-                process_set_cwd((home[0] != '\0') ? home : "/");
-
-                vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-                vga_write("welcome, ");
-                vga_write(name);
-                vga_writeln(admin ? " (admin)" : "");
-                vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                return true;
+            if (p) {
+                p->uid   = uid;                     /* 权限检查就看这两个 */
+                p->admin = admin;
             }
+            process_set_cwd((home[0] != '\0') ? home : "/");
+
+            vga_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+            vga_write("welcome, ");
+            vga_write(name);
+            vga_writeln(admin ? " (admin)" : "");
+            vga_set_color(VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            return true;
         }
 
         vga_set_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK);
@@ -402,6 +395,57 @@ bool user_login(void) {
 
     vga_writeln("too many attempts");
     return false;
+}
+
+/* 纯校验，不打印任何东西、不碰键盘。
+ *
+ * user_login 那种"提示 + 读两行"的交互版本只能在 ring 0 用；Shell 搬到
+ * ring 3 之后登录是用户程序收的输入，校验还是得内核做 —— 口令表不能交给
+ * 用户程序去比对，否则任何程序都能自己宣布"我是 root"。
+ * 这里只回答"这组用户名和口令对不对"，改身份由 SYS_LOGIN 负责。
+ */
+bool user_authenticate(const char* name, const char* password,
+                       uint32_t* uid_out, bool* admin_out,
+                       char* home_out, uint32_t home_max) {
+    char stored[16];
+    char want[9];
+    uint32_t uid = 0;
+    bool admin = false;
+    char home[USER_HOME_MAX];
+
+    if (!name || !name[0]) {
+        return false;
+    }
+    if (passwd_load() < 0) {
+        return false;
+    }
+    if (!find_user(name, stored, sizeof(stored), &uid,
+                   home, sizeof(home), &admin)) {
+        return false;
+    }
+
+    hex8(want, user_hash_password(password ? password : ""));
+    if (strcmp(want, stored) != 0) {
+        return false;
+    }
+
+    if (uid_out)  { *uid_out = uid; }
+    if (admin_out) { *admin_out = admin; }
+    if (home_out) {
+        strncpy(home_out, home, home_max - 1);
+        home_out[home_max - 1] = '\0';
+    }
+    return true;
+}
+
+/* 让 user_name() 跟上当前登录的人。SYS_LOGIN 成功之后由内核调用，
+ * 这样 taskmgr 之类"显示当前用户"的地方不会还留着上一个名字。 */
+void user_set_current_name(const char* name) {
+    if (!name) {
+        return;
+    }
+    strncpy(current_name, name, USER_NAME_MAX - 1);
+    current_name[USER_NAME_MAX - 1] = '\0';
 }
 
 int user_add(const char* name, const char* password, bool admin) {
