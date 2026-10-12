@@ -891,8 +891,7 @@ static void lex_next(void) {
             skip_directive();
             p = lex_p;
             continue;
-        }
-        break;
+        }        break;
     }
 
     lex_p = p;
@@ -1165,6 +1164,56 @@ typedef struct {
     int sidx;        /* is_struct 时：结构体在结构体表里的下标 */
 } vtype_t;
 
+/* ---- 为什么类型是"按引用"传的 ----
+ *
+ * 这个编译器为了省事，把"结构体传参、按值返回、整体赋值"整条路都不做
+ * （README 里结构体那三条限制）。自举的时候这一条直接卡死：hncc 自己有一批
+ *
+ *     static vtype_t type_element(vtype_t t);
+ *     static int type_size(vtype_t t);
+ *
+ * 这样的函数，于是它编译不了自己的源码，报
+ * "parameter 'a' is a struct by value; use a pointer"。
+ * 自己都不支持自己用的写法，说不过去。
+ *
+ * 所以所有碰类型的函数都改成收 vtype_t*，值当参数的地方改成传地址
+ * （`&t`、`&n->ty` 这种），返回类型的地方照旧返回 vtype_t 值 —— 返回结构体
+ * 在这个编译器里是支持的（内部就是"调用方给个隐藏指针"），只有**传参**不支持。
+ * 六个字段的名字和 vtype_t 的字段一一对应：
+ *     base / ptr / ndims / dims[0..3] / is_struct / sidx
+ * 将来真要做结构体值传递，把这批函数的签名换回按值即可，语义完全一样。
+ */
+
+static int type_size(vtype_t* t);
+static int field_offset(vtype_t* t, const char* name);
+static vtype_t field_type(vtype_t* t, const char* name);
+static vtype_t type_element(vtype_t* t);
+static vtype_t type_ptr_to(vtype_t* t);
+static int type_is_ptr_like(vtype_t* t);
+static vtype_t type_int(void);
+
+static int ty_size_of(vtype_t t)                        { return type_size(&t); }
+static vtype_t ty_element_of(vtype_t t)                 { return type_element(&t); }
+static vtype_t ty_ptr_to_of(vtype_t t)                  { return type_ptr_to(&t); }
+static int ty_is_ptr_like_of(vtype_t t)                 { return type_is_ptr_like(&t); }
+static int ty_field_off_of(vtype_t t, const char* name) { return field_offset(&t, name); }
+static vtype_t ty_field_type_of(vtype_t t, const char* name) { return field_type(&t, name); }
+
+/* 给"实参是 type_int() 这种函数调用结果"的调用点用的临时量。
+ * 取址需要一个能落的 lvalue，而 bin_node(..., type_int()) 这种写法改成
+ * bin_node(..., ty_int_lv()) 就少一层临时变量。
+ * **务必初始化成 TY_INT**：全零的 base 是 TY_VOID，用它当 int 会静默
+ * 生成错误的类型推断（该按 4 字节读的地方按别的处理）。 */
+static vtype_t ty_int_tmp;
+static int     ty_tmp_ready;
+
+static vtype_t* ty_int_lv(void) {
+    if (!ty_tmp_ready) {
+        ty_tmp_ready = 1;
+        ty_int_tmp   = type_int();
+    }
+    return &ty_int_tmp;
+}
 /* ---- 结构体表 ----
  *
  * 字段偏移在定义时就算好（每个字段 4 字节对齐，整体大小也向上取整到 4）。
@@ -1279,8 +1328,14 @@ static void make_anon_name(char* out, const char* prefix, int n) {
     *out = '\0';
 }
 
-/* 两个类型是不是同一个东西（用来容忍"重复 typedef 同一个类型"） */
-static int same_type(vtype_t a, vtype_t b) {
+/* 两个类型是不是同一个东西（用来容忍"重复 typedef 同一个类型"）。
+ *
+ * 按引用收：这个编译器不做结构体值传递，而"类型"是个结构体。
+ * 见下面 ty_get / ty_set 那段注释。 */
+static int same_type(vtype_t* pa, vtype_t* pb) {
+    vtype_t a = *pa;
+    vtype_t b = *pb;
+
     if (a.base != b.base || a.ptr != b.ptr || a.ndims != b.ndims ||
         a.is_struct != b.is_struct || a.sidx != b.sidx) {
         return 0;
@@ -1302,7 +1357,7 @@ static void add_typedef(const char* name, vtype_t t) {
          * （`typedef unsigned int uint32_t;` 这种，或者直接来自某个头文件）。
          * 定义成**别的**类型才算错 —— 那是真的在打架，静默覆盖只会让人
          * 查半天。 */
-        if (same_type(typedefs[ti].type, t)) {
+        if (same_type(&typedefs[ti].type, &t)) {
             return;
         }
         fatal("'%s' is already a typedef, and with a different type", name);
@@ -1316,7 +1371,8 @@ static void add_typedef(const char* name, vtype_t t) {
     typedef_n++;
 }
 
-static int type_size(vtype_t t) {
+static int type_size(vtype_t* tp) {
+    vtype_t t = *tp;
     int n;
 
     if (t.ptr > 0) {
@@ -1344,7 +1400,8 @@ static int type_size(vtype_t t) {
 }
 
 /* 结构体的某个字段 */
-static int field_offset(vtype_t t, const char* name) {
+static int field_offset(vtype_t* tp, const char* name) {
+    vtype_t t = *tp;
     const struct_def_t* d;
 
     if (!t.is_struct) {
@@ -1359,7 +1416,8 @@ static int field_offset(vtype_t t, const char* name) {
     return -1;
 }
 
-static vtype_t field_type(vtype_t t, const char* name) {
+static vtype_t field_type(vtype_t* tp, const char* name) {
+    vtype_t t = *tp;
     const struct_def_t* d = &structs[t.sidx];
 
     for (int i = 0; i < d->nfields; i++) {
@@ -1372,7 +1430,9 @@ static vtype_t field_type(vtype_t t, const char* name) {
 }
 
 /* 去掉一层：指针 -> 下一层指针或基类型；数组 -> 少一维 */
-static vtype_t type_element(vtype_t t) {
+static vtype_t type_element(vtype_t* tp) {
+    vtype_t t = *tp;
+
     if (t.ptr > 0) {
         t.ptr--;
         return t;
@@ -1388,8 +1448,8 @@ static vtype_t type_element(vtype_t t) {
     return t;
 }
 
-static int type_is_ptr_like(vtype_t t) {
-    return t.ptr > 0 || t.ndims > 0;
+static int type_is_ptr_like(vtype_t* t) {
+    return t->ptr > 0 || t->ndims > 0;
 }
 
 static vtype_t type_int(void) {
@@ -1408,12 +1468,12 @@ static vtype_t type_char(void) {
     return t;
 }
 
-static vtype_t type_ptr_to(vtype_t t) {
-    vtype_t r = t;
+static vtype_t type_ptr_to(vtype_t* tp) {
+    vtype_t r = *tp;
 
     if (r.ndims > 0) {
         /* int a[10] 退化成的指针：指向元素 */
-        r = type_element(r);
+        r = type_element(&r);
     }
     r.ptr++;
     return r;
@@ -1692,7 +1752,7 @@ static void parse_struct_def(const char* name, int eat_semi)
             copy_str_local(d->fname[d->nfields], fn, sizeof(d->fname[0]));
             d->ftype[d->nfields]  = ft;
             d->offset[d->nfields] = off;
-            off += type_size(ft);
+            off += ty_size_of(ft);
             d->nfields++;
 
             if (!accept_punct(",")) {
@@ -1754,7 +1814,8 @@ static void parse_enum_def(const char* name, int eat_semi)
 }
 
 /* 二元：都从子层拿左值，遇到对应的运算符就继续往上套 */
-static node_t* bin_node(node_t* lhs, node_t* rhs, const char* op, vtype_t ty) {
+static node_t* bin_node(node_t* lhs, node_t* rhs, const char* op, vtype_t* typ) {
+    vtype_t ty = *typ;
     node_t* n = node_new(ND_BIN);
 
     n->a = lhs;
@@ -1775,7 +1836,7 @@ static node_t* parse_multiplicative(void) {
             copy_str_local(op, tok.punct, sizeof(op));
             lex_next();
             rhs = parse_unary();
-            n = bin_node(n, rhs, op, type_int());
+            n = bin_node(n, rhs, op, ty_int_lv());
         } else {
             return n;
         }
@@ -1784,15 +1845,15 @@ static node_t* parse_multiplicative(void) {
 
 /* 指针 + 整数要按元素大小缩放：p+1 前进一个元素，不是一字节。
  * 这一步在语法分析里就把缩放节点插进去，代码生成只认缩放后的整数。 */
-static node_t* scale_pointer_operand(node_t* n, vtype_t ptr_ty) {
+static node_t* scale_pointer_operand(node_t* n, vtype_t* ptr_ty) {
     node_t* scale = node_new(ND_NUM);
     node_t* mul;
 
-    scale->num = type_size(type_element(ptr_ty));
+    scale->num = ty_size_of(type_element(ptr_ty));
     if (scale->num == 1) {
         return n;
     }
-    mul = bin_node(n, scale, "*", type_int());
+    mul = bin_node(n, scale, "*", ty_int_lv());
     return mul;
 }
 
@@ -1809,30 +1870,30 @@ static node_t* parse_additive(void) {
             lex_next();
             rhs = parse_multiplicative();
 
-            if (type_is_ptr_like(n->ty) && !type_is_ptr_like(rhs->ty)) {
-                rhs = scale_pointer_operand(rhs, n->ty);
+            if (ty_is_ptr_like_of(n->ty) && !ty_is_ptr_like_of(rhs->ty)) {
+                rhs = scale_pointer_operand(rhs, &n->ty);
                 rty = n->ty;
-            } else if (type_is_ptr_like(rhs->ty) && !type_is_ptr_like(n->ty) &&
+            } else if (ty_is_ptr_like_of(rhs->ty) && !ty_is_ptr_like_of(n->ty) &&
                        op[0] == '+') {
-                rhs = scale_pointer_operand(n, rhs->ty);
+                rhs = scale_pointer_operand(n, &rhs->ty);
                 rty = rhs->ty;
-            } else if (op[0] == '-' && type_is_ptr_like(n->ty) &&
-                       type_is_ptr_like(rhs->ty)) {
+            } else if (op[0] == '-' && ty_is_ptr_like_of(n->ty) &&
+                       ty_is_ptr_like_of(rhs->ty)) {
                 /* 指针相减：先算字节差，再除以元素大小 */
-                int esize = type_size(type_element(n->ty));
+                int esize = ty_size_of(ty_element_of(n->ty));
 
-                n = bin_node(n, rhs, "-", type_int());
+                n = bin_node(n, rhs, "-", ty_int_lv());
                 if (esize > 1) {
                     node_t* d = node_new(ND_NUM);
 
                     d->num = esize;
-                    n = bin_node(n, d, "/", type_int());
+                    n = bin_node(n, d, "/", ty_int_lv());
                 }
                 continue;
             } else {
                 rty = type_int();
             }
-            n = bin_node(n, rhs, op, rty);
+            n = bin_node(n, rhs, op, &rty);
         } else {
             return n;
         }
@@ -1849,7 +1910,7 @@ static node_t* parse_shift(void) {
         copy_str_local(op, tok.punct, sizeof(op));
         lex_next();
         rhs = parse_additive();
-        n = bin_node(n, rhs, op, type_int());
+        n = bin_node(n, rhs, op, ty_int_lv());
     }
     return n;
 }
@@ -1864,7 +1925,7 @@ static node_t* parse_relational(void) {
         copy_str_local(op, tok.punct, sizeof(op));
         lex_next();
         rhs = parse_shift();
-        n = bin_node(n, rhs, op, type_int());
+        n = bin_node(n, rhs, op, ty_int_lv());
     }
     return n;
 }
@@ -1879,7 +1940,7 @@ static node_t* parse_equality(void) {
         copy_str_local(op, tok.punct, sizeof(op));
         lex_next();
         rhs = parse_relational();
-        n = bin_node(n, rhs, op, type_int());
+        n = bin_node(n, rhs, op, ty_int_lv());
     }
     return n;
 }
@@ -1892,7 +1953,7 @@ static node_t* parse_bitand(void) {
 
         lex_next();
         rhs = parse_equality();
-        n = bin_node(n, rhs, "&", type_int());
+        n = bin_node(n, rhs, "&", ty_int_lv());
     }
     return n;
 }
@@ -1905,7 +1966,7 @@ static node_t* parse_bitxor(void) {
 
         lex_next();
         rhs = parse_bitand();
-        n = bin_node(n, rhs, "^", type_int());
+        n = bin_node(n, rhs, "^", ty_int_lv());
     }
     return n;
 }
@@ -1918,7 +1979,7 @@ static node_t* parse_bitor(void) {
 
         lex_next();
         rhs = parse_bitxor();
-        n = bin_node(n, rhs, "|", type_int());
+        n = bin_node(n, rhs, "|", ty_int_lv());
     }
     return n;
 }
@@ -1931,7 +1992,7 @@ static node_t* parse_logand(void) {
 
         lex_next();
         rhs = parse_bitor();
-        n = bin_node(n, rhs, "&&", type_int());
+        n = bin_node(n, rhs, "&&", ty_int_lv());
     }
     return n;
 }
@@ -1944,7 +2005,7 @@ static node_t* parse_logor(void) {
 
         lex_next();
         rhs = parse_logand();
-        n = bin_node(n, rhs, "||", type_int());
+        n = bin_node(n, rhs, "||", ty_int_lv());
     }
     return n;
 }
@@ -2079,17 +2140,17 @@ static node_t* parse_unary(void) {
         node_t* n = node_new(ND_ADDR);
 
         n->a = parse_unary();
-        n->ty = type_ptr_to(n->a->ty);
+        n->ty = ty_ptr_to_of(n->a->ty);
         return n;
     }
     if (accept_punct("*")) {
         node_t* n = node_new(ND_DEREF);
 
         n->a = parse_unary();
-        if (!type_is_ptr_like(n->a->ty)) {
+        if (!ty_is_ptr_like_of(n->a->ty)) {
             fatal("cannot dereference a value that is not a pointer");
         }
-        n->ty = type_element(n->a->ty);
+        n->ty = ty_element_of(n->a->ty);
         return n;
     }
     if (accept_punct("++")) {
@@ -2123,7 +2184,7 @@ static node_t* parse_unary(void) {
                     t.ptr++;
                 }
                 expect_punct(")");
-                n->num = type_size(t);
+                n->num = ty_size_of(t);
                 return n;
             }
             /* 不是类型：把 token 流倒回去，按表达式处理 */
@@ -2134,7 +2195,7 @@ static node_t* parse_unary(void) {
         {
             node_t* e = parse_unary();
 
-            n->num = type_size(e->ty);
+            n->num = ty_size_of(e->ty);
             return n;
         }
     }
@@ -2293,14 +2354,14 @@ static node_t* parse_postfix(void) {
             idx = parse_expr();
             expect_punct("]");
 
-            if (!type_is_ptr_like(n->ty)) {
+            if (!ty_is_ptr_like_of(n->ty)) {
                 fatal("subscripted value is not an array or pointer");
             }
             /* a[i] 等价于 *(a + i)，缩放交给指针加法那套规则 */
-            add = bin_node(n, scale_pointer_operand(idx, n->ty), "+", n->ty);
+            add = bin_node(n, scale_pointer_operand(idx, &n->ty), "+", &n->ty);
             n = node_new(ND_DEREF);
             n->a = add;
-            n->ty = type_element(add->ty);
+            n->ty = ty_element_of(add->ty);
         } else if (is_punct(".") || is_punct("->")) {
             /* 成员访问：a.f 和 p->f。
              *
@@ -2326,7 +2387,7 @@ static node_t* parse_postfix(void) {
             if (!sty.is_struct || sty.ptr != 0) {
                 fatal("'.' needs a struct (got something else)");
             }
-            off = field_offset(sty, fname);
+            off = ty_field_off_of(sty, fname);
             if (off < 0) {
                 fatal("struct '%s' has no member named '%s'",
                       structs[sty.sidx].name, fname);
@@ -2337,7 +2398,7 @@ static node_t* parse_postfix(void) {
             m->via_ptr = via_ptr;
             m->field_off = off;
             copy_str_local(m->name, fname, sizeof(m->name));
-            m->ty = field_type(sty, fname);
+            m->ty = ty_field_type_of(sty, fname);
             n = m;
         } else if (is_punct("++")) {
             node_t* p = node_new(ND_POSTINC);
@@ -2363,7 +2424,8 @@ static node_t* parse_postfix(void) {
 
 /* 把声明记进符号表。scope=SYM_GLOBAL 时进全局表，否则进当前函数。
  * 返回符号指针，offset/是否 bss 由代码生成阶段填。 */
-static struct sym* declare_symbol(const char* name, vtype_t t, int kind) {
+static struct sym* declare_symbol(const char* name, vtype_t* tp, int kind) {
+    vtype_t t = *tp;
     struct sym* s;
 
     if (kind == SYM_GLOBAL) {
@@ -2402,7 +2464,7 @@ static struct sym* declare_symbol(const char* name, vtype_t t, int kind) {
     s->ptr    = t.ptr;
     s->nelem  = (t.ndims > 0) ? t.dims[0] : 0;
     s->type   = t.base;
-    s->size   = type_size(t);
+    s->size   = type_size(&t);
     s->is_struct = t.is_struct;
     s->sidx      = t.sidx;
     return s;
@@ -2810,7 +2872,7 @@ static node_t* parse_declaration(int eat_semi) {
              * 填 [ebp+8+4i] 这个偏移，而语法树里引用的是同一批符号。 */
             local_n = 0;
             for (int i = 0; i < f->nparams; i++) {
-                f->param_sym[i] = declare_symbol(f->pname[i], f->ptype[i],
+                f->param_sym[i] = declare_symbol(f->pname[i], &f->ptype[i],
                                                  SYM_PARAM);
             }
             parsing_global = 0;
@@ -2838,7 +2900,7 @@ static node_t* parse_declaration(int eat_semi) {
             if (t.ndims > 0 && t.dims[0] == 0) {
                 inferred = 1;              /* `int a[] = {...}`：长度等下补 */
             }
-            s = declare_symbol(name, t, is_global ? SYM_GLOBAL : SYM_LOCAL);
+            s = declare_symbol(name, &t, is_global ? SYM_GLOBAL : SYM_LOCAL);
 
             n = node_new(ND_DECL);
             copy_str_local(n->name, name, sizeof(n->name));
@@ -2876,7 +2938,7 @@ static node_t* parse_declaration(int eat_semi) {
                     if (inferred) {
                         t.dims[0] = count;
                         s->nelem = count;
-                        s->size = type_size(t);
+                        s->size = ty_size_of(t);
                     } else if (count > t.dims[0]) {
                         fatal("too many initialisers for '%s' (%d > %d)",
                               name, count, t.dims[0]);
@@ -2888,7 +2950,7 @@ static node_t* parse_declaration(int eat_semi) {
                         /* `char s[] = "abc"` -> 长度是 strlen + 1 */
                         t.dims[0] = n->a->str_len + 1;
                         s->nelem = t.dims[0];
-                        s->size = type_size(t);
+                        s->size = ty_size_of(t);
                     }
                 } else {
                     n->a = parse_assign();
@@ -3380,8 +3442,8 @@ static void gen_incdec(node_t* n, int delta, int post) {
     int step = 1;
     int change;
 
-    if (type_is_ptr_like(n->a->ty)) {
-        step = type_size(type_element(n->a->ty));
+    if (ty_is_ptr_like_of(n->a->ty)) {
+        step = ty_size_of(ty_element_of(n->a->ty));
     }
     change = delta * step;
     if (change == 0) {
@@ -3794,8 +3856,8 @@ static void gen_stmt(node_t* n) {
                  * 因为这是一条语句，不像全局那样要求常量） */
                 if (n->a->kind == ND_INITLIST) {
                     vtype_t at_ty = sym_vtype(n->sym);
-                    vtype_t el_ty = type_element(at_ty);
-                    int esize = type_size(el_ty);
+                    vtype_t el_ty = ty_element_of(at_ty);
+                    int esize = ty_size_of(el_ty);
                     int i = 0;
 
                     for (node_t* e = n->a->a; e; e = e->next) {
@@ -3827,7 +3889,7 @@ static void gen_stmt(node_t* n) {
 
                     if (dt.ndims > 0 && dt.ptr == 0 && dt.base == TY_CHAR) {
                         int len = n->a->str_len + 1;      /* 含结尾的 0 */
-                        int room = type_size(dt);
+                        int room = ty_size_of(dt);
 
                         if (len > room) {
                             fatal("initialiser for '%s' does not fit (%d > %d)",
@@ -4137,7 +4199,7 @@ static void assign_locals(node_t* s, int* used) {
     for (; s; s = s->next) {
         switch (s->kind) {
             case ND_DECL: {
-                int size = type_size(sym_vtype(s->sym));
+                int size = ty_size_of(sym_vtype(s->sym));
 
                 size = (size + 3) & ~3;
                 *used += size;
@@ -4172,7 +4234,7 @@ static void assign_locals(node_t* s, int* used) {
                     /* `for (int i = 0, j = 3; ...)` 是一条 ND_DECL 链，
                      * 每个声明符都要槽位（原来只处理链头，j 就没槽了）。 */
                     for (node_t* d = s->a; d; d = d->next) {
-                        int size = type_size(sym_vtype(d->sym));
+                        int size = ty_size_of(sym_vtype(d->sym));
 
                         size = (size + 3) & ~3;
                         *used += size;
@@ -4346,7 +4408,7 @@ static void layout_globals(void) {
 
         if (!d->a) {
             /* 没初值：bss */
-            int size = type_size(t);
+            int size = ty_size_of(t);
 
             size = (size + 3) & ~3;
             s->is_bss = 1;
@@ -4358,9 +4420,9 @@ static void layout_globals(void) {
         if (d->a->kind == ND_INITLIST) {
             /* 全局数组的初始化列表：元素必须是常量，直接铺进数据区，
              * 没写到的位置留 0（data_emit_zeros 已经把整块清零了）。 */
-            vtype_t el_ty = type_element(t);
-            int esize = type_size(el_ty);
-            int total = type_size(t);
+            vtype_t el_ty = ty_element_of(t);
+            int esize = ty_size_of(el_ty);
+            int total = ty_size_of(t);
             int at = data_emit_zeros(total);
             int i = 0;
 
@@ -4396,7 +4458,7 @@ static void layout_globals(void) {
                 data_ref_word(at, str_off);
             } else {
                 /* char buf[N] = "abc";  内容直接铺进去，不够的补 0 */
-                int total = type_size(t);
+                int total = ty_size_of(t);
                 int at = data_emit_zeros(total);
 
                 s->offset = at;
